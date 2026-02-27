@@ -3,15 +3,33 @@ import sys
 import time
 import uuid
 import random
+import secrets
 import logging
 import asyncio
 from typing import Optional, Union
 import argparse
-from quart import Quart, request, jsonify
+from quart import Quart, request, jsonify, session, redirect
 from camoufox.async_api import AsyncCamoufox
 from patchright.async_api import async_playwright
-from db_results import init_db, save_result, load_result, cleanup_old_results
+from db_results import (
+    init_db, close_db, save_result, load_result, cleanup_old_results, load_recent_results,
+    get_task_stats, upsert_user, get_user_by_id, get_all_users,
+    CREDIT_COST_PER_TASK, CREDIT_EXCHANGE_RATE,
+    init_user_credits, get_user_credits, deduct_credits, refund_credits, add_credits,
+    get_credit_log, daily_checkin, get_checkin_status,
+    create_order, get_order_by_trade_no, update_order_paid, get_user_orders,
+    admin_get_all_credits, admin_adjust_credits, admin_get_all_orders,
+)
 from browser_configs import browser_config
+from auth import (
+    get_oauth_config, oauth_configured, build_authorize_url, exchange_code_for_token,
+    fetch_user_info, verify_admin, require_admin, require_user, generate_state,
+    close_http_client,
+)
+from credit import (
+    credit_configured, get_credit_config, verify_sign, generate_out_trade_no,
+    build_payment_url,
+)
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -63,6 +81,7 @@ class TurnstileAPIServer:
 
     def __init__(self, headless: bool, useragent: Optional[str], debug: bool, browser_type: str, thread: int, proxy_support: bool, use_random_config: bool = False, browser_name: Optional[str] = None, browser_version: Optional[str] = None):
         self.app = Quart(__name__)
+        self.app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
         self.debug = debug
         self.browser_type = browser_type
         self.headless = headless
@@ -72,9 +91,10 @@ class TurnstileAPIServer:
         self.use_random_config = use_random_config
         self.browser_name = browser_name
         self.browser_version = browser_version
+        self._pool_rebuilding = False
         self.console = Console()
         
-        # Initialize useragent and sec_ch_ua attributes
+        # 初始化 useragent 和 sec_ch_ua 属性
         self.useragent = useragent
         self.sec_ch_ua = None
         
@@ -102,24 +122,17 @@ class TurnstileAPIServer:
         self._setup_routes()
 
     def display_welcome(self):
-        """Displays welcome screen with logo."""
+        """显示带有 Logo 的欢迎界面"""
         self.console.clear()
         
         combined_text = Text()
-        combined_text.append("\n📢 Channel: ", style="bold white")
-        combined_text.append("https://t.me/D3_vin", style="cyan")
-        combined_text.append("\n💬 Chat: ", style="bold white")
-        combined_text.append("https://t.me/D3vin_chat", style="cyan")
-        combined_text.append("\n📁 GitHub: ", style="bold white")
-        combined_text.append("https://github.com/D3-vin", style="cyan")
-        combined_text.append("\n📁 Version: ", style="bold white")
+        combined_text.append("\n版本: ", style="bold white")
         combined_text.append("1.2b", style="green")
         combined_text.append("\n")
 
         info_panel = Panel(
             Align.left(combined_text),
             title="[bold blue]Turnstile Solver[/bold blue]",
-            subtitle="[bold magenta]Dev by D3vin[/bold magenta]",
             box=box.ROUNDED,
             border_style="bright_blue",
             padding=(0, 1),
@@ -133,30 +146,65 @@ class TurnstileAPIServer:
 
 
     def _setup_routes(self) -> None:
-        """Set up the application routes."""
+        """设置应用路由"""
         self.app.before_serving(self._startup)
+        self.app.after_serving(self._shutdown)
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
         self.app.route('/')(self.index)
+        # 认证路由
+        self.app.route('/auth/login')(self.auth_login_page)
+        self.app.route('/auth/callback')(self.auth_callback)
+        self.app.route('/auth/logout')(self.auth_logout)
+        # 管理员登录路由
+        self.app.route('/admin/login', methods=['GET', 'POST'])(self.admin_login)
+        self.app.route('/admin/logout')(self.admin_logout)
+        # 管理界面路由（需要管理员认证）
+        self.app.route('/admin/')(require_admin(self.admin_page))
+        self.app.route('/admin/api/status')(require_admin(self.admin_status))
+        self.app.route('/admin/api/tasks')(require_admin(self.admin_tasks))
+        self.app.route('/admin/api/config', methods=['POST'])(require_admin(self.admin_update_config))
+        self.app.route('/admin/api/restart-pool', methods=['POST'])(require_admin(self.admin_restart_pool))
+        self.app.route('/admin/api/cleanup', methods=['POST'])(require_admin(self.admin_cleanup))
+        self.app.route('/admin/api/users')(require_admin(self.admin_users))
+        # 用户仪表盘路由
+        self.app.route('/dashboard/')(require_user(self.user_dashboard))
+        self.app.route('/api/user/credits')(require_user(self.api_user_credits))
+        self.app.route('/api/user/checkin', methods=['POST'])(require_user(self.api_user_checkin))
+        self.app.route('/api/user/credit-log')(require_user(self.api_user_credit_log))
+        self.app.route('/api/user/recharge', methods=['POST'])(require_user(self.api_user_recharge))
+        self.app.route('/api/user/orders')(require_user(self.api_user_orders))
+        # 支付回调（无认证，EasyPay 平台调用）
+        self.app.route('/pay/notify', methods=['GET'])(self.pay_notify)
+        self.app.route('/pay/return', methods=['GET'])(self.pay_return)
+        # 管理员积分管理
+        self.app.route('/admin/api/credits')(require_admin(self.admin_credits_list))
+        self.app.route('/admin/api/credits/adjust', methods=['POST'])(require_admin(self.admin_credits_adjust))
+        self.app.route('/admin/api/orders')(require_admin(self.admin_orders_list))
         
 
     async def _startup(self) -> None:
-        """Initialize the browser and page pool on startup."""
+        """启动时初始化浏览器和页面池"""
         self.display_welcome()
         logger.info("Starting browser initialization")
         try:
             await init_db()
             await self._initialize_browser()
             
-            # Запускаем периодическую очистку старых результатов
+            # 启动定期清理旧结果的任务
             asyncio.create_task(self._periodic_cleanup())
             
         except Exception as e:
             logger.error(f"Failed to initialize browser: {str(e)}")
             raise
 
+    async def _shutdown(self) -> None:
+        """关闭时清理资源"""
+        await close_db()
+        await close_http_client()
+
     async def _initialize_browser(self) -> None:
-        """Initialize the browser and create the page pool."""
+        """初始化浏览器并创建页面池"""
         playwright = None
         camoufox = None
 
@@ -184,7 +232,7 @@ class TurnstileAPIServer:
                     useragent = self.useragent
                     sec_ch_ua = getattr(self, 'sec_ch_ua', '')
             else:
-                # Для camoufox и других браузеров используем значения по умолчанию
+                # 对于 camoufox 和其他浏览器使用默认值
                 browser = self.browser_type
                 version = 'custom'
                 useragent = self.useragent
@@ -237,7 +285,7 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
 
     async def _periodic_cleanup(self):
-        """Periodic cleanup of old results every hour"""
+        """每小时定期清理旧结果"""
         while True:
             try:
                 await asyncio.sleep(3600)
@@ -246,6 +294,38 @@ class TurnstileAPIServer:
                     logger.info(f"Cleaned up {deleted_count} old results")
             except Exception as e:
                 logger.error(f"Error during periodic cleanup: {e}")
+
+    async def _rebuild_browser_pool(self):
+        """排空并关闭空闲浏览器，用新配置重建池"""
+        if self._pool_rebuilding:
+            return
+        self._pool_rebuilding = True
+        try:
+            logger.info("Rebuilding browser pool...")
+            # 排空并关闭所有空闲浏览器
+            closed = 0
+            while not self.browser_pool.empty():
+                try:
+                    _idx, browser, _cfg = self.browser_pool.get_nowait()
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+                    closed += 1
+                except asyncio.QueueEmpty:
+                    break
+            logger.info(f"Closed {closed} idle browsers")
+
+            # 替换队列
+            self.browser_pool = asyncio.Queue()
+
+            # 用当前配置重新初始化
+            await self._initialize_browser()
+            logger.info("Browser pool rebuilt successfully")
+        except Exception as e:
+            logger.error(f"Error rebuilding browser pool: {e}")
+        finally:
+            self._pool_rebuilding = False
 
     async def _antishadow_inject(self, page):
         await page.add_init_script("""
@@ -264,7 +344,7 @@ class TurnstileAPIServer:
 
 
     async def _optimized_route_handler(self, route):
-        """Оптимизированный обработчик маршрутов для экономии ресурсов."""
+        """优化的路由处理器，用于节省资源"""
         url = route.request.url
         resource_type = route.request.resource_type
 
@@ -284,15 +364,15 @@ class TurnstileAPIServer:
             await route.abort()
 
     async def _block_rendering(self, page):
-        """Блокировка рендеринга для экономии ресурсов"""
+        """阻止渲染以节省资源"""
         await page.route("**/*", self._optimized_route_handler)
 
     async def _unblock_rendering(self, page):
-        """Разблокировка рендеринга"""
+        """解除渲染阻止"""
         await page.unroute("**/*", self._optimized_route_handler)
 
     async def _find_turnstile_elements(self, page, index: int):
-        """Умная проверка всех возможных Turnstile элементов"""
+        """智能检测所有可能的 Turnstile 元素"""
         selectors = [
             '.cf-turnstile',
             '[data-sitekey]',
@@ -305,11 +385,11 @@ class TurnstileAPIServer:
         elements = []
         for selector in selectors:
             try:
-                # Безопасная проверка count()
+                # 安全检查 count()
                 try:
                     count = await page.locator(selector).count()
                 except Exception:
-                    # Если count() дает ошибку, пропускаем этот селектор
+                    # 如果 count() 出错，跳过该选择器
                     continue
                     
                 if count > 0:
@@ -324,9 +404,9 @@ class TurnstileAPIServer:
         return elements
 
     async def _find_and_click_checkbox(self, page, index: int):
-        """Найти и кликнуть по чекбоксу Turnstile CAPTCHA внутри iframe"""
+        """在 iframe 中查找并点击 Turnstile CAPTCHA 复选框"""
         try:
-            # Пробуем разные селекторы iframe с защитой от ошибок
+            # 尝试不同的 iframe 选择器（带错误保护）
             iframe_selectors = [
                 'iframe[src*="challenges.cloudflare.com"]',
                 'iframe[src*="turnstile"]',
@@ -337,7 +417,7 @@ class TurnstileAPIServer:
             for selector in iframe_selectors:
                 try:
                     test_locator = page.locator(selector).first
-                    # Безопасная проверка count для iframe
+                    # 安全检查 iframe 的 count
                     try:
                         iframe_count = await test_locator.count()
                     except Exception:
@@ -355,12 +435,12 @@ class TurnstileAPIServer:
             
             if iframe_locator:
                 try:
-                    # Получаем frame из iframe
+                    # 从 iframe 获取 frame
                     iframe_element = await iframe_locator.element_handle()
                     frame = await iframe_element.content_frame()
                     
                     if frame:
-                        # Ищем чекбокс внутри iframe
+                        # 在 iframe 中查找复选框
                         checkbox_selectors = [
                             'input[type="checkbox"]',
                             '.cb-lb input[type="checkbox"]',
@@ -369,16 +449,16 @@ class TurnstileAPIServer:
                         
                         for selector in checkbox_selectors:
                             try:
-                                # Полностью избегаем locator.count() в iframe - используем альтернативный подход
+                                # 完全避免在 iframe 中使用 locator.count() - 使用替代方案
                                 try:
-                                    # Пробуем кликнуть напрямую без count проверки
+                                    # 尝试直接点击，不进行 count 检查
                                     checkbox = frame.locator(selector).first
                                     await checkbox.click(timeout=2000)
                                     if self.debug:
                                         logger.debug(f"Browser {index}: Successfully clicked checkbox in iframe with selector '{selector}'")
                                     return True
                                 except Exception as click_e:
-                                    # Если прямой клик не сработал, записываем в debug но не падаем
+                                    # 如果直接点击失败，记录调试信息但不崩溃
                                     if self.debug:
                                         logger.debug(f"Browser {index}: Direct checkbox click failed for '{selector}': {str(click_e)}")
                                     continue
@@ -387,7 +467,7 @@ class TurnstileAPIServer:
                                     logger.debug(f"Browser {index}: Iframe checkbox selector '{selector}' failed: {str(e)}")
                                 continue
                     
-                        # Если нашли iframe, но не смогли кликнуть чекбокс, пробуем клик по iframe
+                        # 如果找到了 iframe 但无法点击复选框，尝试直接点击 iframe
                         try:
                             if self.debug:
                                 logger.debug(f"Browser {index}: Trying to click iframe directly as fallback")
@@ -433,14 +513,14 @@ class TurnstileAPIServer:
         return False
 
     async def _safe_click(self, page, selector: str, index: int):
-        """Полностью безопасный клик с максимальной защитой от ошибок"""
+        """完全安全的点击操作，具有最大的错误保护"""
         try:
-            # Пробуем кликнуть напрямую без count() проверки
+            # 尝试直接点击，不进行 count() 检查
             locator = page.locator(selector).first
             await locator.click(timeout=1000)
             return True
         except Exception as e:
-            # Логируем ошибку только в debug режиме
+            # 仅在调试模式下记录错误
             if self.debug and "Can't query n-th element" not in str(e):
                 logger.debug(f"Browser {index}: Safe click failed for '{selector}': {str(e)}")
             return False
@@ -483,8 +563,8 @@ class TurnstileAPIServer:
         if self.debug:
             logger.debug(f"Browser {index}: Created CAPTCHA overlay with sitekey: {websiteKey}")
 
-    async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
-        """Solve the Turnstile challenge."""
+    async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None, user_id: Optional[int] = None):
+        """求解 Turnstile 验证"""
         proxy = None
 
         index, browser, browser_config = await self.browser_pool.get()
@@ -495,6 +575,8 @@ class TurnstileAPIServer:
                     logger.warning(f"Browser {index}: Browser disconnected, skipping")
                 await self.browser_pool.put((index, browser, browser_config))
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
+                if user_id:
+                    await refund_credits(user_id, CREDIT_COST_PER_TASK, "求解失败退款", task_id)
                 return
         except Exception as e:
             if self.debug:
@@ -642,7 +724,7 @@ class TurnstileAPIServer:
 
             await self._unblock_rendering(page)
 
-            # Ждем немного времени для загрузки CAPTCHA
+            # 等待一段时间让 CAPTCHA 加载
             await asyncio.sleep(3)
 
             locator = page.locator('input[name="cf-turnstile-response"]')
@@ -650,7 +732,7 @@ class TurnstileAPIServer:
             
             for attempt in range(max_attempts):
                 try:
-                    # Безопасная проверка количества элементов с токеном
+                    # 安全检查带令牌的元素数量
                     try:
                         count = await locator.count()
                     except Exception as e:
@@ -662,7 +744,7 @@ class TurnstileAPIServer:
                         if self.debug:
                             logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
                     elif count == 1:
-                        # Если только один элемент, проверяем его токен
+                        # 如果只有一个元素，检查其令牌
                         try:
                             token = await locator.input_value(timeout=500)
                             if token:
@@ -674,7 +756,7 @@ class TurnstileAPIServer:
                             if self.debug:
                                 logger.debug(f"Browser {index}: Single token element check failed: {str(e)}")
                     else:
-                        # Если несколько элементов, проверяем все по очереди
+                        # 如果有多个元素，逐一检查
                         if self.debug:
                             logger.debug(f"Browser {index}: Found {count} token elements, checking all")
                         
@@ -691,7 +773,7 @@ class TurnstileAPIServer:
                                     logger.debug(f"Browser {index}: Token element {i} check failed: {str(e)}")
                                 continue
                     
-                    # Клик стратегии только каждые 3 попытки и не сразу
+                    # 仅每隔3次尝试执行点击策略，且不在开始时执行
                     if attempt > 2 and attempt % 3 == 0:
                         click_success = await self._try_click_strategies(page, index)
                         if not click_success and self.debug:
@@ -700,7 +782,7 @@ class TurnstileAPIServer:
                     # Fallback overlay на 10 попытке если токена все еще нет
                     if attempt == 10:
                         try:
-                            # Безопасная проверка count для overlay
+                            # 安全检查 overlay 的 count
                             try:
                                 current_count = await locator.count()
                             except Exception:
@@ -715,7 +797,7 @@ class TurnstileAPIServer:
                             if self.debug:
                                 logger.debug(f"Browser {index}: Fallback overlay creation failed: {str(e)}")
                     
-                    # Адаптивное ожидание
+                    # 自适应等待
                     wait_time = min(0.5 + (attempt * 0.05), 2.0)
                     await asyncio.sleep(wait_time)
                     
@@ -729,11 +811,15 @@ class TurnstileAPIServer:
             
             elapsed_time = round(time.time() - start_time, 3)
             await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
+            if user_id:
+                await refund_credits(user_id, CREDIT_COST_PER_TASK, "求解失败退款", task_id)
             if self.debug:
                 logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
         except Exception as e:
             elapsed_time = round(time.time() - start_time, 3)
             await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
+            if user_id:
+                await refund_credits(user_id, CREDIT_COST_PER_TASK, "求解异常退款", task_id)
             if self.debug:
                 logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
         finally:
@@ -766,7 +852,16 @@ class TurnstileAPIServer:
 
 
     async def process_turnstile(self):
-        """Handle the /turnstile endpoint requests."""
+        """处理 /turnstile 端点请求"""
+        # 配额拦截：必须登录
+        user_id = session.get("user_id")
+        if not user_id:
+            return jsonify({
+                "errorId": 1,
+                "errorCode": "ERROR_UNAUTHORIZED",
+                "errorDescription": "请先登录"
+            }), 401
+
         url = request.args.get('url')
         sitekey = request.args.get('sitekey')
         action = request.args.get('action')
@@ -779,6 +874,14 @@ class TurnstileAPIServer:
                 "errorDescription": "Both 'url' and 'sitekey' are required"
             }), 200
 
+        # 配额拦截：原子扣减积分
+        if not await deduct_credits(user_id, CREDIT_COST_PER_TASK, "验证码求解", ""):
+            return jsonify({
+                "errorId": 1,
+                "errorCode": "ERROR_INSUFFICIENT_CREDITS",
+                "errorDescription": "积分余额不足，请先充值"
+            }), 402
+
         task_id = str(uuid.uuid4())
         await save_result(task_id, "turnstile", {
             "status": "CAPTCHA_NOT_READY",
@@ -790,7 +893,7 @@ class TurnstileAPIServer:
         })
 
         try:
-            asyncio.create_task(self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata))
+            asyncio.create_task(self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata, user_id=user_id))
 
             if self.debug:
                 logger.debug(f"Request completed with taskid {task_id}.")
@@ -807,7 +910,7 @@ class TurnstileAPIServer:
             }), 200
 
     async def get_result(self):
-        """Return solved data"""
+        """返回求解结果"""
         task_id = request.args.get('id')
 
         if not task_id:
@@ -852,12 +955,27 @@ class TurnstileAPIServer:
 
     
 
-    @staticmethod
-    async def index():
-        """Serve the API documentation page."""
-        return """
+    async def index(self):
+        """提供 API 文档页面"""
+        username = session.get("username")
+        if username:
+            user_block = f"""
+                <div class="flex items-center justify-between mb-4 px-1">
+                    <span class="text-sm text-gray-400">欢迎, <span class="text-blue-300">{username}</span></span>
+                    <div class="flex items-center gap-3">
+                        <a href="/dashboard/" class="text-xs text-green-400 hover:text-green-300">我的积分</a>
+                        <a href="/auth/logout" class="text-xs text-red-400 hover:text-red-300">登出</a>
+                    </div>
+                </div>"""
+        else:
+            user_block = """
+                <div class="flex justify-end mb-4 px-1">
+                    <a href="/auth/login" class="text-sm text-blue-400 hover:text-blue-300">Linux DO 登录</a>
+                </div>"""
+
+        return f"""
             <!DOCTYPE html>
-            <html lang="en">
+            <html lang="zh-CN">
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -865,51 +983,872 @@ class TurnstileAPIServer:
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
             <body class="bg-gray-900 text-gray-200 min-h-screen flex items-center justify-center">
-                <div class="bg-gray-800 p-8 rounded-lg shadow-md max-w-2xl w-full border border-red-500">
-                    <h1 class="text-3xl font-bold mb-6 text-center text-red-500">Welcome to Turnstile Solver API</h1>
+                <div class="bg-gray-800 p-8 rounded-lg shadow-md max-w-2xl w-full border border-blue-500">
+                    {user_block}
+                    <h1 class="text-3xl font-bold mb-6 text-center text-blue-400">Turnstile Solver API</h1>
 
-                    <p class="mb-4 text-gray-300">To use the turnstile service, send a GET request to 
-                       <code class="bg-red-700 text-white px-2 py-1 rounded">/turnstile</code> with the following query parameters:</p>
+                    <p class="mb-4 text-gray-300">使用验证码求解服务，请向
+                       <code class="bg-blue-700 text-white px-2 py-1 rounded">/turnstile</code> 发送 GET 请求，并附带以下参数：</p>
 
                     <ul class="list-disc pl-6 mb-6 text-gray-300">
-                        <li><strong>url</strong>: The URL where Turnstile is to be validated</li>
-                        <li><strong>sitekey</strong>: The site key for Turnstile</li>
+                        <li><strong>url</strong>: 需要验证 Turnstile 的目标网址</li>
+                        <li><strong>sitekey</strong>: Turnstile 站点密钥</li>
                     </ul>
 
-                    <div class="bg-gray-700 p-4 rounded-lg mb-6 border border-red-500">
-                        <p class="font-semibold mb-2 text-red-400">Example usage:</p>
-                        <code class="text-sm break-all text-red-300">/turnstile?url=https://example.com&sitekey=sitekey</code>
-                    </div>
-
-
-                    <div class="bg-gray-700 p-4 rounded-lg mb-6">
-                        <p class="text-gray-200 font-semibold mb-3">📢 Connect with Us</p>
-                        <div class="space-y-2 text-sm">
-                            <p class="text-gray-300">
-                                📢 <strong>Channel:</strong> 
-                                <a href="https://t.me/D3_vin" class="text-red-300 hover:underline">https://t.me/D3_vin</a> 
-                                - Latest updates and releases
-                            </p>
-                            <p class="text-gray-300">
-                                💬 <strong>Chat:</strong> 
-                                <a href="https://t.me/D3vin_chat" class="text-red-300 hover:underline">https://t.me/D3vin_chat</a> 
-                                - Community support and discussions
-                            </p>
-                            <p class="text-gray-300">
-                                📁 <strong>GitHub:</strong> 
-                                <a href="https://github.com/D3-vin" class="text-red-300 hover:underline">https://github.com/D3-vin</a> 
-                                - Source code and development
-                            </p>
-                        </div>
+                    <div class="bg-gray-700 p-4 rounded-lg mb-6 border border-blue-500">
+                        <p class="font-semibold mb-2 text-blue-400">使用示例：</p>
+                        <code class="text-sm break-all text-blue-300">/turnstile?url=https://example.com&sitekey=sitekey</code>
                     </div>
                 </div>
             </body>
             </html>
         """
 
+    async def auth_login_page(self):
+        """Linux DO OAuth 登录页面"""
+        if not oauth_configured():
+            return "<h1>OAuth 未配置</h1><p>请设置 LINUXDO_CLIENT_ID, LINUXDO_CLIENT_SECRET, LINUXDO_REDIRECT_URI 环境变量</p>", 500
+        state = generate_state()
+        session["oauth_state"] = state
+        auth_url = build_authorize_url(state)
+        return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>登录 - Turnstile Solver</title><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-200 min-h-screen flex items-center justify-center">
+<div class="bg-gray-900 border border-gray-700 rounded-lg p-8 max-w-sm w-full text-center">
+<h1 class="text-2xl font-bold text-blue-400 mb-2">Turnstile Solver</h1>
+<p class="text-gray-400 text-sm mb-6">使用 Linux DO 账号登录</p>
+<a href="{auth_url}" class="block w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 px-4 rounded-lg transition">
+Linux DO 登录</a>
+<a href="/" class="block mt-4 text-xs text-gray-500 hover:text-gray-300">← 返回首页</a>
+</div></body></html>"""
+
+    async def auth_callback(self):
+        """OAuth 回调处理"""
+        code = request.args.get("code")
+        state = request.args.get("state")
+        if not code:
+            return jsonify({"error": "missing code"}), 400
+        saved_state = session.pop("oauth_state", None)
+        if not state or state != saved_state:
+            return jsonify({"error": "invalid state"}), 400
+
+        token_data = await exchange_code_for_token(code)
+        if not token_data or "access_token" not in token_data:
+            return jsonify({"error": "token exchange failed"}), 500
+
+        user_info = await fetch_user_info(token_data["access_token"])
+        if not user_info or "id" not in user_info:
+            return jsonify({"error": "failed to get user info"}), 500
+
+        user = await upsert_user(user_info)
+        if user:
+            session["user_id"] = user["id"]
+            session["linuxdo_id"] = user["linuxdo_id"]
+            session["username"] = user["username"]
+            session["trust_level"] = user["trust_level"]
+            await init_user_credits(user["id"], user["trust_level"])
+        return redirect("/")
+
+    async def auth_logout(self):
+        """用户登出"""
+        session.pop("user_id", None)
+        session.pop("linuxdo_id", None)
+        session.pop("username", None)
+        session.pop("trust_level", None)
+        return redirect("/")
+
+    async def admin_login(self):
+        """管理员登录页面和处理"""
+        if session.get("is_admin"):
+            return redirect("/admin/")
+
+        error = ""
+        if request.method == "POST":
+            form = await request.form
+            username = form.get("username", "")
+            password = form.get("password", "")
+            if verify_admin(username, password):
+                session["is_admin"] = True
+                return redirect("/admin/")
+            error = "用户名或密码错误"
+
+        return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>管理员登录 - Turnstile Solver</title><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="bg-gray-950 text-gray-200 min-h-screen flex items-center justify-center">
+<div class="bg-gray-900 border border-gray-700 rounded-lg p-8 max-w-sm w-full">
+<h1 class="text-xl font-bold text-blue-400 mb-1 text-center">管理员登录</h1>
+<p class="text-gray-500 text-xs mb-6 text-center">Turnstile Solver 管理面板</p>
+{'<p class="text-red-400 text-sm mb-4 text-center">' + error + '</p>' if error else ''}
+<form method="POST">
+<div class="mb-4"><label class="block text-xs text-gray-400 mb-1">用户名</label>
+<input name="username" type="text" required class="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:border-blue-500 outline-none"></div>
+<div class="mb-6"><label class="block text-xs text-gray-400 mb-1">密码</label>
+<input name="password" type="password" required class="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:border-blue-500 outline-none"></div>
+<button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 rounded-lg transition">登录</button>
+</form>
+<a href="/" class="block mt-4 text-xs text-gray-500 hover:text-gray-300 text-center">← 返回首页</a>
+</div></body></html>"""
+
+    async def admin_logout(self):
+        """管理员登出"""
+        session.pop("is_admin", None)
+        return redirect("/admin/login")
+
+    async def admin_page(self):
+        """管理界面 HTML（缓存）"""
+        if not hasattr(self, '_admin_page_html'):
+            self._admin_page_html = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Turnstile Solver - 管理面板</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+@keyframes pulse-dot { 0%,100%{opacity:.4} 50%{opacity:1} }
+.pulse-dot{animation:pulse-dot 1.5s infinite}
+.toggle-checkbox:checked{right:0;border-color:#3b82f6}
+.toggle-checkbox:checked+.toggle-label{background-color:#3b82f6}
+.toggle-checkbox{right:1.25rem;transition:all .2s}
+</style>
+</head>
+<body class="bg-gray-950 text-gray-200 min-h-screen">
+<div class="max-w-7xl mx-auto px-4 py-6">
+  <!-- 顶部栏 -->
+  <div class="flex items-center justify-between mb-6">
+    <h1 class="text-2xl font-bold text-blue-400">Turnstile Solver 管理面板</h1>
+    <div class="flex items-center gap-3">
+      <span id="rebuild-badge" class="hidden items-center gap-1 px-3 py-1 bg-yellow-600/30 text-yellow-300 rounded-full text-xs font-medium"><span class="pulse-dot inline-block w-2 h-2 rounded-full bg-yellow-400"></span>浏览器池重建中…</span>
+      <span class="text-xs text-gray-400">管理员</span>
+      <a href="/admin/logout" class="text-xs text-red-400 hover:text-red-300 transition">登出</a>
+      <a href="/" class="text-sm text-gray-400 hover:text-blue-400 transition">← 返回首页</a>
+    </div>
+  </div>
+
+  <!-- 统计卡片 -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+    <div class="bg-gray-900 border border-gray-700 rounded-lg p-4"><p class="text-xs text-gray-400 mb-1">浏览器池</p><p id="stat-pool" class="text-2xl font-bold text-blue-400">-</p></div>
+    <div class="bg-gray-900 border border-gray-700 rounded-lg p-4"><p class="text-xs text-gray-400 mb-1">待处理</p><p id="stat-pending" class="text-2xl font-bold text-yellow-400">-</p></div>
+    <div class="bg-gray-900 border border-gray-700 rounded-lg p-4"><p class="text-xs text-gray-400 mb-1">成功</p><p id="stat-success" class="text-2xl font-bold text-green-400">-</p></div>
+    <div class="bg-gray-900 border border-gray-700 rounded-lg p-4"><p class="text-xs text-gray-400 mb-1">失败</p><p id="stat-failed" class="text-2xl font-bold text-red-400">-</p></div>
+  </div>
+
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <!-- 左侧配置面板 -->
+    <div class="lg:col-span-1 space-y-4">
+      <!-- 即时配置 -->
+      <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <h2 class="text-sm font-semibold text-gray-300 mb-3">即时配置</h2>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between">
+            <span class="text-sm">调试模式</span>
+            <label class="relative inline-flex items-center cursor-pointer"><input type="checkbox" id="cfg-debug" class="toggle-checkbox sr-only peer" onchange="toggleConfig('debug',this.checked)"><div class="toggle-label w-10 h-5 bg-gray-600 rounded-full peer-checked:bg-blue-600 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-5"></div></label>
+          </div>
+          <div class="flex items-center justify-between">
+            <span class="text-sm">代理支持</span>
+            <label class="relative inline-flex items-center cursor-pointer"><input type="checkbox" id="cfg-proxy_support" class="toggle-checkbox sr-only peer" onchange="toggleConfig('proxy_support',this.checked)"><div class="toggle-label w-10 h-5 bg-gray-600 rounded-full peer-checked:bg-blue-600 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-5"></div></label>
+          </div>
+          <div class="flex items-center justify-between">
+            <span class="text-sm">随机UA配置</span>
+            <label class="relative inline-flex items-center cursor-pointer"><input type="checkbox" id="cfg-use_random_config" class="toggle-checkbox sr-only peer" onchange="toggleConfig('use_random_config',this.checked)"><div class="toggle-label w-10 h-5 bg-gray-600 rounded-full peer-checked:bg-blue-600 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-5"></div></label>
+          </div>
+        </div>
+      </div>
+
+      <!-- 浏览器池配置 -->
+      <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <h2 class="text-sm font-semibold text-gray-300 mb-3">浏览器池配置 <span class="text-xs text-yellow-500">（修改后需重启）</span></h2>
+        <div class="space-y-3">
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">浏览器类型</label>
+            <select id="cfg-browser_type" class="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-sm focus:border-blue-500 outline-none">
+              <option value="chromium">Chromium</option>
+              <option value="chrome">Chrome</option>
+              <option value="msedge">Edge</option>
+              <option value="camoufox">Camoufox</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">并发数</label>
+            <input id="cfg-thread_count" type="number" min="1" max="32" class="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-sm focus:border-blue-500 outline-none">
+          </div>
+          <div class="flex items-center justify-between">
+            <span class="text-sm">无头模式</span>
+            <label class="relative inline-flex items-center cursor-pointer"><input type="checkbox" id="cfg-headless" class="toggle-checkbox sr-only peer"><div class="toggle-label w-10 h-5 bg-gray-600 rounded-full peer-checked:bg-blue-600 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-5"></div></label>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">浏览器名称</label>
+            <input id="cfg-browser_name" type="text" placeholder="例如 chrome" class="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-sm focus:border-blue-500 outline-none">
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1">浏览器版本</label>
+            <input id="cfg-browser_version" type="text" placeholder="例如 139" class="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-sm focus:border-blue-500 outline-none">
+          </div>
+          <button onclick="applyPoolConfig()" class="w-full mt-2 bg-blue-600 hover:bg-blue-700 text-white text-sm py-2 rounded transition font-medium">应用并重启浏览器池</button>
+        </div>
+      </div>
+
+      <!-- 数据库维护 -->
+      <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <h2 class="text-sm font-semibold text-gray-300 mb-3">数据库维护</h2>
+        <div class="flex gap-2">
+          <select id="cleanup-days" class="bg-gray-800 border border-gray-600 rounded px-2 py-1.5 text-sm flex-1">
+            <option value="1">1 天前</option>
+            <option value="3">3 天前</option>
+            <option value="7" selected>7 天前</option>
+            <option value="30">30 天前</option>
+          </select>
+          <button onclick="cleanupDB()" class="bg-red-600/80 hover:bg-red-700 text-white text-sm px-4 py-1.5 rounded transition">清理</button>
+        </div>
+        <p id="cleanup-result" class="text-xs text-gray-500 mt-2 hidden"></p>
+      </div>
+
+      <!-- 用户管理 -->
+      <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm font-semibold text-gray-300">已登录用户</h2>
+          <span class="text-xs text-gray-500" id="user-total">共 0 人</span>
+        </div>
+        <div class="space-y-2 max-h-48 overflow-y-auto" id="user-list">
+          <p class="text-xs text-gray-600">加载中…</p>
+        </div>
+      </div>
+
+      <!-- 积分管理 -->
+      <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm font-semibold text-gray-300">积分管理</h2>
+          <span class="text-xs text-gray-500" id="credit-total">共 0 人</span>
+        </div>
+        <div class="space-y-2 max-h-48 overflow-y-auto" id="credit-list">
+          <p class="text-xs text-gray-600">加载中…</p>
+        </div>
+        <div class="mt-3 border-t border-gray-700 pt-3">
+          <p class="text-xs text-gray-400 mb-2">调整积分</p>
+          <div class="flex gap-2">
+            <input id="adj-uid" type="number" placeholder="用户ID" class="w-20 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs focus:border-blue-500 outline-none">
+            <input id="adj-amount" type="number" placeholder="积分(正/负)" class="w-24 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs focus:border-blue-500 outline-none">
+            <input id="adj-desc" type="text" placeholder="说明" class="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs focus:border-blue-500 outline-none">
+            <button onclick="adjustCredits()" class="bg-blue-600 hover:bg-blue-700 text-white text-xs px-3 py-1 rounded transition">调整</button>
+          </div>
+          <p id="adj-result" class="text-xs text-gray-500 mt-1 hidden"></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右侧任务列表 -->
+    <div class="lg:col-span-2 bg-gray-900 border border-gray-700 rounded-lg p-4">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-sm font-semibold text-gray-300">任务列表</h2>
+        <div class="flex items-center gap-2">
+          <select id="task-filter" class="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs" onchange="currentPage=1;loadTasks()">
+            <option value="all">全部</option>
+            <option value="pending">待处理</option>
+            <option value="success">成功</option>
+            <option value="failed">失败</option>
+          </select>
+          <span class="text-xs text-gray-500" id="task-total">共 0 条</span>
+        </div>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead><tr class="text-gray-400 border-b border-gray-700"><th class="text-left py-2 px-2">任务ID</th><th class="text-left py-2 px-2">状态</th><th class="text-left py-2 px-2">耗时</th><th class="text-left py-2 px-2">创建时间</th></tr></thead>
+          <tbody id="task-tbody"></tbody>
+        </table>
+      </div>
+      <div class="flex items-center justify-between mt-3">
+        <button onclick="prevPage()" id="btn-prev" class="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded disabled:opacity-30 disabled:cursor-not-allowed transition" disabled>上一页</button>
+        <span id="page-info" class="text-xs text-gray-500">1 / 1</span>
+        <button onclick="nextPage()" id="btn-next" class="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded disabled:opacity-30 disabled:cursor-not-allowed transition" disabled>下一页</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let currentPage=1, totalPages=1, pollTimer=null, hasPending=false;
+
+function api(path,opts){return fetch('/admin/api/'+path,opts).then(r=>r.json())}
+
+async function loadStatus(){
+  try{
+    const d=await api('status');
+    document.getElementById('stat-pool').textContent=d.pool_available+'/'+d.pool_total;
+    document.getElementById('stat-pending').textContent=d.stats.pending;
+    document.getElementById('stat-success').textContent=d.stats.success;
+    document.getElementById('stat-failed').textContent=d.stats.failed;
+    hasPending=d.stats.pending>0;
+    document.getElementById('rebuild-badge').classList.toggle('hidden',!d.pool_rebuilding);
+    document.getElementById('rebuild-badge').classList.toggle('flex',d.pool_rebuilding);
+    // 同步配置到UI
+    const c=d.config;
+    document.getElementById('cfg-debug').checked=c.debug;
+    document.getElementById('cfg-proxy_support').checked=c.proxy_support;
+    document.getElementById('cfg-use_random_config').checked=c.use_random_config;
+    document.getElementById('cfg-browser_type').value=c.browser_type;
+    document.getElementById('cfg-thread_count').value=c.thread_count;
+    document.getElementById('cfg-headless').checked=c.headless;
+    document.getElementById('cfg-browser_name').value=c.browser_name||'';
+    document.getElementById('cfg-browser_version').value=c.browser_version||'';
+  }catch(e){console.error('loadStatus',e)}
+}
+
+async function loadTasks(){
+  try{
+    const filter=document.getElementById('task-filter').value;
+    const d=await api('tasks?page='+currentPage+'&per_page=20&filter='+filter);
+    totalPages=d.total_pages;
+    document.getElementById('task-total').textContent='共 '+d.total+' 条';
+    document.getElementById('page-info').textContent=d.page+' / '+d.total_pages;
+    document.getElementById('btn-prev').disabled=(d.page<=1);
+    document.getElementById('btn-next').disabled=(d.page>=d.total_pages);
+    const tbody=document.getElementById('task-tbody');
+    tbody.innerHTML='';
+    d.items.forEach(t=>{
+      let status,cls;
+      if(typeof t.data==='object'){
+        if(t.data.status==='CAPTCHA_NOT_READY'){status='待处理';cls='text-yellow-400'}
+        else if(t.data.value==='CAPTCHA_FAIL'){status='失败';cls='text-red-400'}
+        else if(t.data.value){status='成功';cls='text-green-400'}
+        else{status='未知';cls='text-gray-400'}
+      }else{status='未知';cls='text-gray-400'}
+      const elapsed=t.data&&t.data.elapsed_time?t.data.elapsed_time+'s':'-';
+      const tr=document.createElement('tr');
+      tr.className='border-b border-gray-800 hover:bg-gray-800/50';
+      tr.innerHTML='<td class="py-2 px-2 font-mono text-gray-400" title="'+t.task_id+'">'+t.task_id.substring(0,8)+'…</td><td class="py-2 px-2"><span class="'+cls+'">'+status+'</span></td><td class="py-2 px-2">'+elapsed+'</td><td class="py-2 px-2 text-gray-500">'+( t.created_at||'-')+'</td>';
+      tbody.appendChild(tr);
+    });
+    if(d.items.length===0){
+      tbody.innerHTML='<tr><td colspan="4" class="text-center py-8 text-gray-600">暂无任务</td></tr>';
+    }
+  }catch(e){console.error('loadTasks',e)}
+}
+
+function prevPage(){if(currentPage>1){currentPage--;loadTasks()}}
+function nextPage(){if(currentPage<totalPages){currentPage++;loadTasks()}}
+
+async function toggleConfig(key,val){
+  try{
+    const payload={};payload[key]=val;
+    await api('config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  }catch(e){console.error('toggleConfig',e)}
+}
+
+async function applyPoolConfig(){
+  if(!confirm('确定要修改浏览器池配置并重启吗？\\n正在运行的任务不会被中断，但在重启期间新任务将排队等待。')) return;
+  const payload={
+    browser_type:document.getElementById('cfg-browser_type').value,
+    thread_count:parseInt(document.getElementById('cfg-thread_count').value)||4,
+    headless:document.getElementById('cfg-headless').checked,
+    browser_name:document.getElementById('cfg-browser_name').value||null,
+    browser_version:document.getElementById('cfg-browser_version').value||null
+  };
+  try{
+    await api('config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    await api('restart-pool',{method:'POST'});
+    loadStatus();
+  }catch(e){console.error('applyPoolConfig',e)}
+}
+
+async function cleanupDB(){
+  const days=document.getElementById('cleanup-days').value;
+  try{
+    const d=await api('cleanup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({days_old:parseInt(days)})});
+    const el=document.getElementById('cleanup-result');
+    el.textContent='已清理 '+d.deleted+' 条记录';
+    el.classList.remove('hidden');
+    setTimeout(()=>el.classList.add('hidden'),5000);
+    loadStatus();loadTasks();
+  }catch(e){console.error('cleanupDB',e)}
+}
+
+async function loadUsers(){
+  try{
+    const d=await api('users');
+    document.getElementById('user-total').textContent='共 '+d.total+' 人';
+    const el=document.getElementById('user-list');
+    if(d.items.length===0){el.innerHTML='<p class="text-xs text-gray-600">暂无用户</p>';return;}
+    el.innerHTML=d.items.map(u=>'<div class="flex items-center justify-between text-xs py-1 border-b border-gray-800"><div class="flex items-center gap-2"><span class="text-gray-300">'+u.username+'</span><span class="text-gray-600">'+(u.name||'')+'</span></div><div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded text-[10px] '+(u.trust_level>=2?'bg-green-900/50 text-green-400':'bg-gray-800 text-gray-400')+'">TL'+u.trust_level+'</span></div></div>').join('');
+  }catch(e){console.error('loadUsers',e)}
+}
+
+async function loadCreditsAdmin(){
+  try{
+    const d=await api('credits');
+    document.getElementById('credit-total').textContent='共 '+d.total+' 人';
+    const el=document.getElementById('credit-list');
+    if(d.items.length===0){el.innerHTML='<p class="text-xs text-gray-600">暂无数据</p>';return;}
+    el.innerHTML=d.items.map(c=>'<div class="flex items-center justify-between text-xs py-1 border-b border-gray-800"><div class="flex items-center gap-2"><span class="text-gray-300">'+c.username+'</span><span class="text-gray-600">ID:'+c.id+'</span></div><div class="flex items-center gap-2"><span class="text-green-400 font-mono">'+c.balance+'</span><span class="text-gray-600">TL'+c.trust_level+'</span></div></div>').join('');
+  }catch(e){console.error('loadCreditsAdmin',e)}
+}
+
+async function adjustCredits(){
+  const uid=document.getElementById('adj-uid').value;
+  const amount=document.getElementById('adj-amount').value;
+  const desc=document.getElementById('adj-desc').value;
+  const el=document.getElementById('adj-result');
+  if(!uid||!amount){el.textContent='请填写用户ID和积分';el.className='text-xs mt-1 text-red-400';el.classList.remove('hidden');return;}
+  try{
+    const d=await api('credits/adjust',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:parseInt(uid),amount:parseFloat(amount),description:desc})});
+    if(d.success){el.textContent='调整成功';el.className='text-xs mt-1 text-green-400';loadCreditsAdmin();}
+    else{el.textContent='调整失败';el.className='text-xs mt-1 text-red-400';}
+    el.classList.remove('hidden');setTimeout(()=>el.classList.add('hidden'),3000);
+  }catch(e){el.textContent='网络错误';el.className='text-xs mt-1 text-red-400';el.classList.remove('hidden');}
+}
+
+function startPolling(){
+  async function tick(){
+    await Promise.all([loadStatus(),loadTasks()]);
+    pollTimer=setTimeout(tick, hasPending?2000:5000);
+  }
+  tick();
+  loadUsers();
+  loadCreditsAdmin();
+  setInterval(loadUsers,30000);
+  setInterval(loadCreditsAdmin,30000);
+}
+
+startPolling();
+</script>
+</body>
+</html>"""
+        return self._admin_page_html
+
+    async def admin_status(self):
+        """系统状态 API"""
+        stats = await get_task_stats()
+        return jsonify({
+            "pool_available": self.browser_pool.qsize(),
+            "pool_total": self.thread_count,
+            "pool_rebuilding": self._pool_rebuilding,
+            "stats": stats,
+            "config": {
+                "debug": self.debug,
+                "browser_type": self.browser_type,
+                "headless": self.headless,
+                "thread_count": self.thread_count,
+                "proxy_support": self.proxy_support,
+                "use_random_config": self.use_random_config,
+                "browser_name": self.browser_name,
+                "browser_version": self.browser_version,
+            }
+        })
+
+    async def admin_tasks(self):
+        """分页任务列表 API"""
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 20, type=int)
+        task_filter = request.args.get('filter', 'all')
+
+        data = await load_recent_results(page, per_page, status_filter=task_filter)
+
+        return jsonify(data)
+
+    async def admin_update_config(self):
+        """修改配置 API"""
+        body = await request.get_json()
+        if not body:
+            return jsonify({"error": "empty body"}), 400
+
+        hot_keys = {"debug", "proxy_support", "use_random_config"}
+        pool_keys = {"browser_type", "thread_count", "headless", "browser_name", "browser_version"}
+
+        changed = []
+        for key, val in body.items():
+            if key in hot_keys:
+                setattr(self, key, val)
+                changed.append(key)
+            elif key in pool_keys:
+                setattr(self, key, val)
+                changed.append(key)
+
+        return jsonify({"updated": changed})
+
+    async def admin_restart_pool(self):
+        """手动触发浏览器池重启"""
+        if self._pool_rebuilding:
+            return jsonify({"status": "already_rebuilding"})
+        asyncio.create_task(self._rebuild_browser_pool())
+        return jsonify({"status": "rebuild_started"})
+
+    async def admin_cleanup(self):
+        """手动清理数据库旧数据"""
+        body = await request.get_json() or {}
+        days = body.get("days_old", 7)
+        deleted = await cleanup_old_results(days_old=days)
+        return jsonify({"deleted": deleted})
+
+    async def admin_users(self):
+        """用户列表 API"""
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 50, type=int)
+        data = await get_all_users(page, per_page)
+        return jsonify(data)
+
+    # ========== 用户积分仪表盘 ==========
+
+    async def api_user_credits(self):
+        """用户积分 API"""
+        user_id = session["user_id"]
+        credits = await get_user_credits(user_id)
+        checkin = await get_checkin_status(user_id)
+        return jsonify({"credits": credits, "checkin": checkin})
+
+    async def api_user_checkin(self):
+        """每日签到 API"""
+        user_id = session["user_id"]
+        trust_level = session.get("trust_level", 0)
+        result = await daily_checkin(user_id, trust_level)
+        if result is None:
+            return jsonify({"error": "今日已签到"}), 400
+        return jsonify(result)
+
+    async def api_user_credit_log(self):
+        """积分流水 API"""
+        user_id = session["user_id"]
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 15, type=int)
+        data = await get_credit_log(user_id, page, per_page)
+        return jsonify(data)
+
+    async def api_user_recharge(self):
+        """创建充值订单 API"""
+        if not credit_configured():
+            return jsonify({"error": "充值功能未配置"}), 503
+        body = await request.get_json()
+        if not body:
+            return jsonify({"error": "参数错误"}), 400
+        money = body.get("money")
+        try:
+            money = float(money)
+            if money < 1 or money > 10000:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({"error": "金额无效，请输入 1~10000"}), 400
+
+        user_id = session["user_id"]
+        amount = money * CREDIT_EXCHANGE_RATE
+        cfg = get_credit_config()
+        out_trade_no = generate_out_trade_no(user_id)
+
+        order_id = await create_order(user_id, out_trade_no, money, amount)
+        if not order_id:
+            return jsonify({"error": "创建订单失败"}), 500
+
+        notify_url = request.host_url.rstrip("/") + "/pay/notify"
+        return_url = request.host_url.rstrip("/") + "/dashboard/"
+
+        pay_url = build_payment_url(
+            pid=cfg["pid"], key=cfg["key"],
+            out_trade_no=out_trade_no,
+            name=f"积分充值 {amount} 积分",
+            money=f"{money:.2f}",
+            notify_url=notify_url,
+            return_url=return_url,
+        )
+        return jsonify({"pay_url": pay_url, "out_trade_no": out_trade_no})
+
+    async def api_user_orders(self):
+        """用户订单列表 API"""
+        user_id = session["user_id"]
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 10, type=int)
+        data = await get_user_orders(user_id, page, per_page)
+        return jsonify(data)
+
+    async def pay_notify(self):
+        """EasyPay 异步通知回调"""
+        params = dict(request.args)
+        cfg = get_credit_config()
+        if not verify_sign(params, cfg["key"]):
+            return "sign error", 400
+
+        trade_status = params.get("trade_status", "")
+        if trade_status != "TRADE_SUCCESS":
+            return "fail"
+
+        out_trade_no = params.get("out_trade_no", "")
+        trade_no = params.get("trade_no", "")
+        raw_notify = str(params)
+
+        order = await get_order_by_trade_no(out_trade_no)
+        if not order:
+            return "order not found", 400
+
+        updated = await update_order_paid(out_trade_no, trade_no, raw_notify)
+        if updated:
+            await add_credits(
+                order["user_id"], order["amount"], "recharge",
+                f"充值 {order['money']} 元", out_trade_no
+            )
+        return "success"
+
+    async def pay_return(self):
+        """EasyPay 同步跳转"""
+        return redirect("/dashboard/")
+
+    # ========== 管理员积分管理 ==========
+
+    async def admin_credits_list(self):
+        """管理员积分列表 API"""
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 50, type=int)
+        data = await admin_get_all_credits(page, per_page)
+        return jsonify(data)
+
+    async def admin_credits_adjust(self):
+        """管理员调整积分 API"""
+        body = await request.get_json()
+        if not body:
+            return jsonify({"error": "参数错误"}), 400
+        user_id = body.get("user_id")
+        amount = body.get("amount")
+        description = body.get("description", "")
+        if not user_id or amount is None:
+            return jsonify({"error": "user_id 和 amount 必填"}), 400
+        try:
+            amount = float(amount)
+        except (TypeError, ValueError):
+            return jsonify({"error": "amount 无效"}), 400
+        ok = await admin_adjust_credits(int(user_id), amount, description)
+        return jsonify({"success": ok})
+
+    async def admin_orders_list(self):
+        """管理员订单列表 API"""
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 50, type=int)
+        data = await admin_get_all_orders(page, per_page)
+        return jsonify(data)
+
+    # ========== 用户仪表盘页面 ==========
+
+    async def user_dashboard(self):
+        """用户积分仪表盘页面（模板缓存）"""
+        if not hasattr(self, '_dashboard_template'):
+            self._dashboard_template = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>我的积分 - Turnstile Solver</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+@keyframes spin-fast { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }
+.spin-fast{animation:spin-fast .8s linear infinite}
+</style>
+</head>
+<body class="bg-gray-950 text-gray-200 min-h-screen">
+<div class="max-w-5xl mx-auto px-4 py-6">
+  <!-- 顶部栏 -->
+  <div class="flex items-center justify-between mb-6">
+    <h1 class="text-2xl font-bold text-blue-400">我的积分</h1>
+    <div class="flex items-center gap-3">
+      <span class="text-sm text-gray-400">__USERNAME__</span>
+      <a href="/" class="text-xs text-gray-400 hover:text-blue-400 transition">首页</a>
+      <a href="/auth/logout" class="text-xs text-red-400 hover:text-red-300 transition">登出</a>
+    </div>
+  </div>
+
+  <!-- 积分概览 -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+    <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+      <p class="text-xs text-gray-400 mb-1">积分余额</p>
+      <p id="credit-balance" class="text-2xl font-bold text-green-400">-</p>
+    </div>
+    <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+      <p class="text-xs text-gray-400 mb-1">总获得</p>
+      <p id="credit-earned" class="text-2xl font-bold text-blue-400">-</p>
+    </div>
+    <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+      <p class="text-xs text-gray-400 mb-1">总消耗</p>
+      <p id="credit-spent" class="text-2xl font-bold text-yellow-400">-</p>
+    </div>
+    <div class="bg-gray-900 border border-gray-700 rounded-lg p-4 flex flex-col items-center justify-center">
+      <button id="btn-checkin" onclick="doCheckin()" class="w-full bg-green-600 hover:bg-green-700 disabled:bg-gray-700 disabled:text-gray-500 text-white text-sm py-2.5 rounded-lg transition font-medium">签到</button>
+      <p id="checkin-info" class="text-xs text-gray-500 mt-2">-</p>
+    </div>
+  </div>
+
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <!-- 左侧：充值 + 订单 -->
+    <div class="space-y-4">
+      <!-- 充值面板 -->
+      <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <h2 class="text-sm font-semibold text-gray-300 mb-3">积分充值</h2>
+        <div id="recharge-panel">
+          <div class="flex gap-2 mb-3">
+            <input id="recharge-money" type="number" min="1" max="10000" placeholder="充值金额（元）" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:border-blue-500 outline-none">
+            <button onclick="doRecharge()" class="bg-blue-600 hover:bg-blue-700 text-white text-sm px-4 py-2 rounded transition font-medium">充值</button>
+          </div>
+          <p class="text-xs text-gray-500">1 元 = 1 积分，最低 1 元</p>
+          <p id="recharge-msg" class="text-xs mt-2 hidden"></p>
+        </div>
+        <div id="recharge-unavailable" class="hidden">
+          <p class="text-xs text-gray-500">充值功能未配置</p>
+        </div>
+      </div>
+
+      <!-- 订单记录 -->
+      <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm font-semibold text-gray-300">订单记录</h2>
+          <span class="text-xs text-gray-500" id="order-total">共 0 条</span>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-xs">
+            <thead><tr class="text-gray-400 border-b border-gray-700"><th class="text-left py-2 px-2">订单号</th><th class="text-left py-2 px-2">金额</th><th class="text-left py-2 px-2">积分</th><th class="text-left py-2 px-2">状态</th><th class="text-left py-2 px-2">时间</th></tr></thead>
+            <tbody id="order-tbody"></tbody>
+          </table>
+        </div>
+        <div class="flex items-center justify-between mt-2">
+          <button onclick="orderPrev()" id="order-btn-prev" class="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded disabled:opacity-30 transition" disabled>上一页</button>
+          <span id="order-page-info" class="text-xs text-gray-500">1 / 1</span>
+          <button onclick="orderNext()" id="order-btn-next" class="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded disabled:opacity-30 transition" disabled>下一页</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右侧：积分明细 -->
+    <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-sm font-semibold text-gray-300">积分明细</h2>
+        <span class="text-xs text-gray-500" id="log-total">共 0 条</span>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead><tr class="text-gray-400 border-b border-gray-700"><th class="text-left py-2 px-2">时间</th><th class="text-left py-2 px-2">类型</th><th class="text-left py-2 px-2">金额</th><th class="text-left py-2 px-2">余额</th><th class="text-left py-2 px-2">说明</th></tr></thead>
+          <tbody id="log-tbody"></tbody>
+        </table>
+      </div>
+      <div class="flex items-center justify-between mt-2">
+        <button onclick="logPrev()" id="log-btn-prev" class="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded disabled:opacity-30 transition" disabled>上一页</button>
+        <span id="log-page-info" class="text-xs text-gray-500">1 / 1</span>
+        <button onclick="logNext()" id="log-btn-next" class="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded disabled:opacity-30 transition" disabled>下一页</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let logPage=1,logTotal=1,orderPage=1,orderTotal=1;
+const TYPE_MAP={initial:'注册赠送',checkin:'签到',recharge:'充值',consume:'消耗',refund:'退款',admin_adjust:'管理员调整'};
+const STATUS_MAP={pending:'待支付',paid:'已支付',failed:'失败',refunded:'已退款'};
+
+async function api(path,opts){const r=await fetch(path,opts);return r.json()}
+
+async function loadCredits(){
+  try{
+    const d=await api('/api/user/credits');
+    document.getElementById('credit-balance').textContent=d.credits.balance;
+    document.getElementById('credit-earned').textContent=d.credits.total_earned;
+    document.getElementById('credit-spent').textContent=d.credits.total_spent;
+    const btn=document.getElementById('btn-checkin');
+    const info=document.getElementById('checkin-info');
+    if(d.checkin.checked_today){btn.disabled=true;btn.textContent='已签到';}
+    info.textContent='连续签到 '+d.checkin.streak+' 天';
+  }catch(e){console.error('loadCredits',e)}
+}
+
+async function doCheckin(){
+  const btn=document.getElementById('btn-checkin');
+  btn.disabled=true;btn.textContent='签到中...';
+  try{
+    const r=await fetch('/api/user/checkin',{method:'POST'});
+    const d=await r.json();
+    if(r.ok){
+      btn.textContent='已签到';
+      alert('签到成功！获得 '+d.credits_earned+' 积分');
+      loadCredits();loadLog();
+    }else{
+      btn.textContent='已签到';
+    }
+  }catch(e){btn.disabled=false;btn.textContent='签到';console.error(e)}
+}
+
+async function doRecharge(){
+  const money=document.getElementById('recharge-money').value;
+  const msg=document.getElementById('recharge-msg');
+  if(!money||money<1){msg.textContent='请输入有效金额';msg.className='text-xs mt-2 text-red-400';msg.classList.remove('hidden');return;}
+  try{
+    const r=await fetch('/api/user/recharge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({money:parseFloat(money)})});
+    const d=await r.json();
+    if(r.ok&&d.pay_url){
+      window.open(d.pay_url,'_blank');
+      msg.textContent='已跳转支付页面，支付完成后请刷新';msg.className='text-xs mt-2 text-green-400';msg.classList.remove('hidden');
+      setTimeout(()=>{loadOrders();loadCredits();},5000);
+    }else{
+      msg.textContent=d.error||'创建订单失败';msg.className='text-xs mt-2 text-red-400';msg.classList.remove('hidden');
+    }
+  }catch(e){msg.textContent='网络错误';msg.className='text-xs mt-2 text-red-400';msg.classList.remove('hidden');}
+}
+
+async function loadLog(){
+  try{
+    const d=await api('/api/user/credit-log?page='+logPage+'&per_page=15');
+    logTotal=d.total_pages;
+    document.getElementById('log-total').textContent='共 '+d.total+' 条';
+    document.getElementById('log-page-info').textContent=d.page+' / '+d.total_pages;
+    document.getElementById('log-btn-prev').disabled=(d.page<=1);
+    document.getElementById('log-btn-next').disabled=(d.page>=d.total_pages);
+    const tbody=document.getElementById('log-tbody');
+    tbody.innerHTML='';
+    if(d.items.length===0){tbody.innerHTML='<tr><td colspan="5" class="text-center py-4 text-gray-600">暂无记录</td></tr>';return;}
+    d.items.forEach(i=>{
+      const cls=i.amount>=0?'text-green-400':'text-red-400';
+      const sign=i.amount>=0?'+':'';
+      const tr=document.createElement('tr');
+      tr.className='border-b border-gray-800';
+      tr.innerHTML='<td class="py-1.5 px-2 text-gray-500">'+(i.created_at||'-')+'</td><td class="py-1.5 px-2">'+(TYPE_MAP[i.type]||i.type)+'</td><td class="py-1.5 px-2 '+cls+'">'+sign+i.amount+'</td><td class="py-1.5 px-2">'+i.balance_after+'</td><td class="py-1.5 px-2 text-gray-500 truncate max-w-[120px]" title="'+(i.description||'')+'">'+(i.description||'-')+'</td>';
+      tbody.appendChild(tr);
+    });
+  }catch(e){console.error('loadLog',e)}
+}
+function logPrev(){if(logPage>1){logPage--;loadLog()}}
+function logNext(){if(logPage<logTotal){logPage++;loadLog()}}
+
+async function loadOrders(){
+  try{
+    const d=await api('/api/user/orders?page='+orderPage+'&per_page=10');
+    orderTotal=d.total_pages;
+    document.getElementById('order-total').textContent='共 '+d.total+' 条';
+    document.getElementById('order-page-info').textContent=d.page+' / '+d.total_pages;
+    document.getElementById('order-btn-prev').disabled=(d.page<=1);
+    document.getElementById('order-btn-next').disabled=(d.page>=d.total_pages);
+    const tbody=document.getElementById('order-tbody');
+    tbody.innerHTML='';
+    if(d.items.length===0){tbody.innerHTML='<tr><td colspan="5" class="text-center py-4 text-gray-600">暂无订单</td></tr>';return;}
+    d.items.forEach(o=>{
+      const scls=o.status==='paid'?'text-green-400':(o.status==='pending'?'text-yellow-400':'text-red-400');
+      const tr=document.createElement('tr');
+      tr.className='border-b border-gray-800';
+      tr.innerHTML='<td class="py-1.5 px-2 font-mono text-gray-400 text-[10px]" title="'+o.out_trade_no+'">'+o.out_trade_no.substring(0,16)+'…</td><td class="py-1.5 px-2">'+o.money+'元</td><td class="py-1.5 px-2">'+o.amount+'</td><td class="py-1.5 px-2 '+scls+'">'+(STATUS_MAP[o.status]||o.status)+'</td><td class="py-1.5 px-2 text-gray-500">'+(o.created_at||'-')+'</td>';
+      tbody.appendChild(tr);
+    });
+  }catch(e){console.error('loadOrders',e)}
+}
+function orderPrev(){if(orderPage>1){orderPage--;loadOrders()}}
+function orderNext(){if(orderPage<orderTotal){orderPage++;loadOrders()}}
+
+// 检查充值是否可用
+fetch('/api/user/recharge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({money:0})}).then(r=>{
+  if(r.status===503){
+    document.getElementById('recharge-panel').classList.add('hidden');
+    document.getElementById('recharge-unavailable').classList.remove('hidden');
+  }
+}).catch(()=>{});
+
+loadCredits();loadLog();loadOrders();
+</script>
+</body>
+</html>"""
+        username = session.get("username", "")
+        return self._dashboard_template.replace("__USERNAME__", username)
+
 
 def parse_args():
-    """Parse command-line arguments."""
+    """解析命令行参数"""
     parser = argparse.ArgumentParser(description="Turnstile API Server")
 
     parser.add_argument('--no-headless', action='store_true', help='Run the browser with GUI (disable headless mode). By default, headless mode is enabled.')
@@ -928,6 +1867,7 @@ def parse_args():
 
 def create_app(headless: bool, useragent: str, debug: bool, browser_type: str, thread: int, proxy_support: bool, use_random_config: bool, browser_name: str, browser_version: str) -> Quart:
     server = TurnstileAPIServer(headless=headless, useragent=useragent, debug=debug, browser_type=browser_type, thread=thread, proxy_support=proxy_support, use_random_config=use_random_config, browser_name=browser_name, browser_version=browser_version)
+    server.app.server = server
     return server.app
 
 
