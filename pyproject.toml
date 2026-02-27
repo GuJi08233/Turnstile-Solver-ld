@@ -1,0 +1,14 @@
+[project]
+name = "turnstile-solver-ld"
+version = "1.2.0"
+description = "Turnstile CAPTCHA Solver API Server"
+requires-python = ">=3.11"
+dependencies = [
+    "quart",
+    "patchright",
+    "camoufox[geoip]",
+    "requests",
+    "aiosqlite",
+    "rich",
+    "httpx",
+]

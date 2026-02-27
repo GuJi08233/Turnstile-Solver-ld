@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Browser Configurations
-Browser configuration with User-Agent and Sec-CH-UA data for TLS fingerprinting
+浏览器配置
+包含 User-Agent 和 Sec-CH-UA 数据的浏览器配置，用于 TLS 指纹模拟
 """
 
 import random
@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple, Optional
 
 
 class BrowserConfig:
-    """Class for working with browser configurations"""
+    """浏览器配置管理类"""
     
     SEC_CH_UA_CONFIGS = {
         "chrome": {
@@ -63,13 +63,13 @@ class BrowserConfig:
     
     def get_random_browser_config(self, browser_type=None) -> Tuple[str, str, str, str]:
         """
-        Get random browser configuration
-        
-        Args:
-            browser_type: Browser type for filtering (chrome, chromium, camoufox)
-            
-        Returns:
-            Tuple[str, str, str, str]: (browser_name, version, user_agent, sec_ch_ua)
+        获取随机浏览器配置
+
+        参数:
+            browser_type: 浏览器类型过滤（chrome、chromium、camoufox）
+
+        返回:
+            Tuple[str, str, str, str]: (浏览器名称, 版本, user_agent, sec_ch_ua)
         """
         if browser_type in ['chrome', 'chromium', 'msedge', 'avast']:
             chromium_browsers = ['chrome', 'edge', 'avast', 'brave']
@@ -130,8 +130,8 @@ class BrowserConfig:
         return self.available_browsers.copy()
     
     def print_all_configs(self):
-        """Print all available configurations to console"""
-        print("=== AVAILABLE BROWSER CONFIGURATIONS ===\n")
+        """打印所有可用配置到控制台"""
+        print("=== 可用浏览器配置 ===\n")
         
         for browser in self.available_browsers:
             print(f"🌐 {browser.upper()}:")
