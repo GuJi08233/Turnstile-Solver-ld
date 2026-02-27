@@ -17,8 +17,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -m patchright install chromium
 
 # 复制项目文件
-COPY *.py .
-COPY proxies.txt .
+COPY *.py ./
+COPY proxies.txt ./
 
 # 数据持久化目录
 RUN mkdir -p /app/data
