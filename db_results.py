@@ -2,9 +2,10 @@ import asyncio
 import aiosqlite
 import json
 import logging
+import os
 from typing import Dict, Any, Optional, Union, List
 
-DB_PATH = "results.db"
+DB_PATH = os.environ.get("DB_PATH", "results.db")
 
 # 积分系统常量
 CREDIT_COST_PER_TASK = 1

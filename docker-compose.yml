@@ -1,0 +1,26 @@
+services:
+  turnstile-solver:
+    build: .
+    ports:
+      - "5072:5072"
+    volumes:
+      - solver-data:/app/data
+      - ./proxies.txt:/app/proxies.txt:ro
+    environment:
+      - SECRET_KEY=changeme
+      # OAuth (可选)
+      # - LINUXDO_CLIENT_ID=
+      # - LINUXDO_CLIENT_SECRET=
+      # - LINUXDO_REDIRECT_URI=
+      # 管理员 (可选)
+      # - ADMIN_USERNAME=admin
+      # - ADMIN_PASSWORD=
+      # 支付 (可选)
+      # - CREDIT_PID=
+      # - CREDIT_KEY=
+      # - CREDIT_GATEWAY=
+    command: ["--host", "0.0.0.0", "--port", "5072", "--thread", "4"]
+    restart: unless-stopped
+
+volumes:
+  solver-data:
