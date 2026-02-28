@@ -1,8 +1,10 @@
 import asyncio
 import aiosqlite
+import hashlib
 import json
 import logging
 import os
+import secrets
 from typing import Dict, Any, Optional, Union, List
 
 DB_PATH = os.environ.get("DB_PATH", "results.db")
@@ -134,6 +136,36 @@ async def init_db():
                 )
             """)
             await db.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, created_at DESC)")
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS api_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    key_hash TEXT UNIQUE NOT NULL,
+                    key_prefix TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used TIMESTAMP,
+                    revoked INTEGER DEFAULT 0
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS proxies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    protocol TEXT NOT NULL DEFAULT 'http',
+                    address TEXT NOT NULL,
+                    username TEXT DEFAULT '',
+                    password TEXT DEFAULT '',
+                    enabled INTEGER DEFAULT 1,
+                    last_used TIMESTAMP,
+                    fail_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_proxies_enabled ON proxies(enabled)")
+
             await db.commit()
             logging.getLogger("TurnstileAPIServer").info(f"Database initialized in WAL mode: {DB_PATH}")
     except Exception as e:
@@ -286,14 +318,22 @@ async def get_task_stats() -> Dict[str, int]:
 async def cleanup_old_results(days_old: int = 1) -> int:
     """清理超过指定天数的旧结果"""
     try:
+        try:
+            days_old = int(days_old)
+        except (TypeError, ValueError):
+            days_old = 1
+        days_old = max(1, min(days_old, 3650))
         db = await get_db()
-        async with db.execute(
-            "DELETE FROM results WHERE created_at < datetime('now', '-{} days')".format(days_old)
-        ) as cursor:
-            deleted_count = cursor.rowcount
-            await db.commit()
-            logging.getLogger("TurnstileAPIServer").info(f"Cleaned up {deleted_count} old results")
-            return deleted_count
+        cursor = await db.execute(
+            "DELETE FROM results WHERE created_at < datetime('now', ?)",
+            (f"-{days_old} days",),
+        )
+        deleted_count = cursor.rowcount
+        if deleted_count is None or deleted_count < 0:
+            deleted_count = 0
+        await db.commit()
+        logging.getLogger("TurnstileAPIServer").info(f"Cleaned up {deleted_count} old results")
+        return deleted_count
     except Exception as e:
         logging.getLogger("TurnstileAPIServer").error(f"Error cleaning up old results: {e}")
         return 0
@@ -717,3 +757,233 @@ async def admin_get_all_orders(page: int = 1, per_page: int = 50) -> Dict[str, A
     except Exception as e:
         logging.getLogger("TurnstileAPIServer").error(f"Error admin get all orders: {e}")
         return {"items": [], "total": 0, "page": page, "per_page": per_page, "total_pages": 1}
+
+
+# ========== API Key 函数 ==========
+
+MAX_KEYS_PER_USER = 5
+
+
+async def create_api_key(user_id: int, name: str = "") -> Optional[str]:
+    """生成 API Key，存储哈希，返回明文（仅此一次可见）。超过限制返回 None。"""
+    try:
+        db = await get_db()
+        async with db.execute(
+            "SELECT COUNT(*) FROM api_keys WHERE user_id = ? AND revoked = 0", (user_id,)
+        ) as cursor:
+            count = (await cursor.fetchone())[0]
+        if count >= MAX_KEYS_PER_USER:
+            return None
+
+        raw_key = "ts_" + secrets.token_hex(32)
+        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+        key_prefix = raw_key[:8]
+
+        await db.execute(
+            "INSERT INTO api_keys (user_id, key_hash, key_prefix, name) VALUES (?, ?, ?, ?)",
+            (user_id, key_hash, key_prefix, name)
+        )
+        await db.commit()
+        return raw_key
+    except Exception as e:
+        logging.getLogger("TurnstileAPIServer").error(f"Error creating API key: {e}")
+        return None
+
+
+async def validate_api_key(raw_key: str) -> Optional[int]:
+    """验证 API Key，返回 user_id 或 None。顺带更新 last_used。"""
+    try:
+        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+        db = await get_db()
+        async with db.execute(
+            "SELECT id, user_id FROM api_keys WHERE key_hash = ? AND revoked = 0",
+            (key_hash,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        key_id, user_id = row[0], row[1]
+        await db.execute(
+            "UPDATE api_keys SET last_used = CURRENT_TIMESTAMP WHERE id = ?", (key_id,)
+        )
+        await db.commit()
+        return user_id
+    except Exception as e:
+        logging.getLogger("TurnstileAPIServer").error(f"Error validating API key: {e}")
+        return None
+
+
+async def list_api_keys(user_id: int) -> List[Dict[str, Any]]:
+    """列出用户的 API Key（不含哈希）"""
+    try:
+        db = await get_db()
+        rows = []
+        async with db.execute(
+            "SELECT id, key_prefix, name, created_at, last_used, revoked FROM api_keys WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,)
+        ) as cursor:
+            async for row in cursor:
+                rows.append(dict(row))
+        return rows
+    except Exception as e:
+        logging.getLogger("TurnstileAPIServer").error(f"Error listing API keys: {e}")
+        return []
+
+
+async def revoke_api_key(user_id: int, key_id: int) -> bool:
+    """软删除（revoked=1），仅允许操作自己的 key"""
+    try:
+        db = await get_db()
+        cursor = await db.execute(
+            "UPDATE api_keys SET revoked = 1 WHERE id = ? AND user_id = ? AND revoked = 0",
+            (key_id, user_id)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.getLogger("TurnstileAPIServer").error(f"Error revoking API key: {e}")
+        return False
+
+
+async def admin_list_all_api_keys(page: int = 1, per_page: int = 50) -> Dict[str, Any]:
+    """管理员查看所有用户的 API Keys"""
+    try:
+        db = await get_db()
+        async with db.execute("SELECT COUNT(*) FROM api_keys") as cursor:
+            total = (await cursor.fetchone())[0]
+        offset = (page - 1) * per_page
+        rows = []
+        async with db.execute("""
+            SELECT ak.id, ak.user_id, u.username, ak.key_prefix, ak.name,
+                   ak.created_at, ak.last_used, ak.revoked
+            FROM api_keys ak LEFT JOIN users u ON ak.user_id = u.id
+            ORDER BY ak.created_at DESC LIMIT ? OFFSET ?
+        """, (per_page, offset)) as cursor:
+            async for row in cursor:
+                rows.append(dict(row))
+        return {
+            "items": rows, "total": total, "page": page,
+            "per_page": per_page, "total_pages": max(1, (total + per_page - 1) // per_page)
+        }
+    except Exception as e:
+        logging.getLogger("TurnstileAPIServer").error(f"Error admin list API keys: {e}")
+        return {"items": [], "total": 0, "page": page, "per_page": per_page, "total_pages": 1}
+
+
+async def admin_create_api_key(user_id: int, name: str = "") -> Optional[str]:
+    """管理员为任意用户创建 API Key，不受 MAX_KEYS_PER_USER 限制"""
+    try:
+        db = await get_db()
+        raw_key = "ts_" + secrets.token_hex(32)
+        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+        key_prefix = raw_key[:8]
+        await db.execute(
+            "INSERT INTO api_keys (user_id, key_hash, key_prefix, name) VALUES (?, ?, ?, ?)",
+            (user_id, key_hash, key_prefix, name)
+        )
+        await db.commit()
+        return raw_key
+    except Exception as e:
+        logging.getLogger("TurnstileAPIServer").error(f"Error admin creating API key: {e}")
+        return None
+
+
+# ========== 代理管理函数 ==========
+
+async def add_proxy(protocol: str, address: str, username: str = "", password: str = "") -> Optional[int]:
+    """添加代理，返回代理 ID"""
+    try:
+        db = await get_db()
+        cursor = await db.execute(
+            "INSERT INTO proxies (protocol, address, username, password) VALUES (?, ?, ?, ?)",
+            (protocol, address, username, password)
+        )
+        await db.commit()
+        return cursor.lastrowid
+    except Exception as e:
+        logging.getLogger("TurnstileAPIServer").error(f"Error adding proxy: {e}")
+        return None
+
+
+async def list_proxies(enabled_only: bool = True, page: int = 1, per_page: int = 50) -> Dict[str, Any]:
+    """分页列出代理"""
+    try:
+        db = await get_db()
+        where = " WHERE enabled = 1" if enabled_only else ""
+        async with db.execute(f"SELECT COUNT(*) FROM proxies{where}") as cursor:
+            total = (await cursor.fetchone())[0]
+        offset = (page - 1) * per_page
+        rows = []
+        async with db.execute(
+            f"SELECT * FROM proxies{where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (per_page, offset)
+        ) as cursor:
+            async for row in cursor:
+                rows.append(dict(row))
+        return {
+            "items": rows, "total": total, "page": page,
+            "per_page": per_page, "total_pages": max(1, (total + per_page - 1) // per_page)
+        }
+    except Exception as e:
+        logging.getLogger("TurnstileAPIServer").error(f"Error listing proxies: {e}")
+        return {"items": [], "total": 0, "page": page, "per_page": per_page, "total_pages": 1}
+
+
+async def update_proxy(proxy_id: int, **kwargs) -> bool:
+    """更新代理属性"""
+    try:
+        allowed = {"protocol", "address", "username", "password", "enabled"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return False
+        db = await get_db()
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [proxy_id]
+        cursor = await db.execute(
+            f"UPDATE proxies SET {set_clause} WHERE id = ?", values
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.getLogger("TurnstileAPIServer").error(f"Error updating proxy {proxy_id}: {e}")
+        return False
+
+
+async def delete_proxy(proxy_id: int) -> bool:
+    """删除代理"""
+    try:
+        db = await get_db()
+        cursor = await db.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logging.getLogger("TurnstileAPIServer").error(f"Error deleting proxy {proxy_id}: {e}")
+        return False
+
+
+async def get_next_proxy() -> Optional[Dict[str, Any]]:
+    """轮询获取下一个可用代理（最久未使用优先）"""
+    try:
+        db = await get_db()
+        async with db.execute(
+            "SELECT * FROM proxies WHERE enabled = 1 ORDER BY last_used IS NOT NULL, last_used ASC LIMIT 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+        return None
+    except Exception as e:
+        logging.getLogger("TurnstileAPIServer").error(f"Error getting next proxy: {e}")
+        return None
+
+
+async def mark_proxy_used(proxy_id: int) -> None:
+    """标记代理已使用"""
+    try:
+        db = await get_db()
+        await db.execute(
+            "UPDATE proxies SET last_used = CURRENT_TIMESTAMP WHERE id = ?", (proxy_id,)
+        )
+        await db.commit()
+    except Exception as e:
+        logging.getLogger("TurnstileAPIServer").error(f"Error marking proxy used {proxy_id}: {e}")

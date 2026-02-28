@@ -4,11 +4,16 @@ import time
 import uuid
 import random
 import secrets
+import json
+import html
+import ipaddress
+import socket
 import logging
 import asyncio
+from urllib.parse import urlparse
 from typing import Optional, Union
 import argparse
-from quart import Quart, request, jsonify, session, redirect
+from quart import Quart, request, jsonify, session, redirect, g
 from camoufox.async_api import AsyncCamoufox
 from patchright.async_api import async_playwright
 from db_results import (
@@ -19,12 +24,15 @@ from db_results import (
     get_credit_log, daily_checkin, get_checkin_status,
     create_order, get_order_by_trade_no, update_order_paid, get_user_orders,
     admin_get_all_credits, admin_adjust_credits, admin_get_all_orders,
+    create_api_key, list_api_keys, revoke_api_key, admin_list_all_api_keys,
+    admin_create_api_key,
+    add_proxy, list_proxies, update_proxy, delete_proxy, get_next_proxy, mark_proxy_used,
 )
 from browser_configs import browser_config
 from auth import (
     get_oauth_config, oauth_configured, build_authorize_url, exchange_code_for_token,
-    fetch_user_info, verify_admin, require_admin, require_user, generate_state,
-    close_http_client,
+    fetch_user_info, verify_admin, require_admin, require_user, require_api_key, generate_state,
+    close_http_client, get_api_key_user_id,
 )
 from credit import (
     credit_configured, get_credit_config, verify_sign, generate_out_trade_no,
@@ -81,7 +89,14 @@ class TurnstileAPIServer:
 
     def __init__(self, headless: bool, useragent: Optional[str], debug: bool, browser_type: str, thread: int, proxy_support: bool, use_random_config: bool = False, browser_name: Optional[str] = None, browser_version: Optional[str] = None):
         self.app = Quart(__name__)
-        self.app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+        secret_key = os.environ.get("SECRET_KEY")
+        self.app.secret_key = secret_key if secret_key else secrets.token_hex(32)
+        self.app.config.update(
+            SESSION_COOKIE_HTTPONLY=True,
+            SESSION_COOKIE_SAMESITE="Lax",
+        )
+        if os.environ.get("SESSION_COOKIE_SECURE", "").lower() in ("1", "true", "yes"):
+            self.app.config["SESSION_COOKIE_SECURE"] = True
         self.debug = debug
         self.browser_type = browser_type
         self.headless = headless
@@ -149,8 +164,8 @@ class TurnstileAPIServer:
         """设置应用路由"""
         self.app.before_serving(self._startup)
         self.app.after_serving(self._shutdown)
-        self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
-        self.app.route('/result', methods=['GET'])(self.get_result)
+        self.app.route('/turnstile', methods=['GET'])(require_api_key(self.process_turnstile))
+        self.app.route('/result', methods=['GET'])(require_api_key(self.get_result))
         self.app.route('/')(self.index)
         # 认证路由
         self.app.route('/auth/login')(self.auth_login_page)
@@ -181,7 +196,101 @@ class TurnstileAPIServer:
         self.app.route('/admin/api/credits')(require_admin(self.admin_credits_list))
         self.app.route('/admin/api/credits/adjust', methods=['POST'])(require_admin(self.admin_credits_adjust))
         self.app.route('/admin/api/orders')(require_admin(self.admin_orders_list))
+        # API Key 管理路由（仅 session 登录用户可操作）
+        self.app.route('/api/user/keys', methods=['GET'])(require_user(self.api_user_keys_list))
+        self.app.route('/api/user/keys', methods=['POST'])(require_user(self.api_user_keys_create))
+        self.app.route('/api/user/keys/<int:key_id>/revoke', methods=['POST'])(require_user(self.api_user_keys_revoke))
+        # 管理员 API Key 查看
+        self.app.route('/admin/api/keys')(require_admin(self.admin_api_keys_list))
+        # 管理员代理管理
+        self.app.route('/admin/api/proxies', methods=['GET'])(require_admin(self.admin_proxies_list))
+        self.app.route('/admin/api/proxies', methods=['POST'])(require_admin(self.admin_proxies_add))
+        self.app.route('/admin/api/proxies/<int:proxy_id>', methods=['PUT'])(require_admin(self.admin_proxies_update))
+        self.app.route('/admin/api/proxies/<int:proxy_id>', methods=['DELETE'])(require_admin(self.admin_proxies_delete))
+        # 管理员为用户创建 Key
+        self.app.route('/admin/api/keys/create', methods=['POST'])(require_admin(self.admin_keys_create))
         
+
+    @staticmethod
+    def _parse_ipv4ish(hostname: str) -> Optional[ipaddress.IPv4Address]:
+        """解析浏览器可能接受的 IPv4 变体（如 127.1、2130706433）。"""
+        host = (hostname or "").strip()
+        if not host:
+            return None
+
+        # 整数形式：例如 2130706433 == 127.0.0.1
+        if host.isdigit():
+            try:
+                value = int(host, 10)
+            except ValueError:
+                return None
+            if 0 <= value <= 2**32 - 1:
+                return ipaddress.IPv4Address(value)
+            return None
+
+        # 点分形式（socket.inet_aton 支持 127.1/127/等缩写）
+        if all(ch.isdigit() or ch == "." for ch in host):
+            try:
+                packed = socket.inet_aton(host)
+                return ipaddress.IPv4Address(packed)
+            except OSError:
+                return None
+
+        return None
+
+    @classmethod
+    def _is_private_host(cls, hostname: str) -> bool:
+        if not hostname:
+            return True
+
+        host = hostname.strip().lower().rstrip(".")
+        if host in ("localhost",) or host.endswith(".localhost"):
+            return True
+        if host.endswith(".local") or host.endswith(".internal"):
+            return True
+
+        ip = None
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = cls._parse_ipv4ish(host)
+
+        if ip is None:
+            return False
+
+        return (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+
+    def _validate_target_url(self, url: str) -> tuple[bool, str]:
+        """基础 SSRF 防护：仅允许 http(s) 且默认禁止本机/内网地址。"""
+        if not isinstance(url, str):
+            return False, "Invalid url"
+
+        url = url.strip()
+        if not url:
+            return False, "Invalid url"
+        if len(url) > 2048:
+            return False, "URL too long"
+
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False, "Only http/https URLs are allowed"
+        if not parsed.hostname:
+            return False, "Invalid URL"
+        if parsed.username or parsed.password:
+            return False, "URL must not include credentials"
+
+        allow_private = os.environ.get("ALLOW_PRIVATE_URLS", "").lower() in ("1", "true", "yes")
+        if not allow_private and self._is_private_host(parsed.hostname):
+            return False, "Private/localhost URLs are not allowed"
+
+        return True, ""
 
     async def _startup(self) -> None:
         """启动时初始化浏览器和页面池"""
@@ -526,6 +635,8 @@ class TurnstileAPIServer:
             return False
 
     async def _load_captcha_overlay(self, page, websiteKey: str, action: str = '', index: int = 0):
+        sitekey_js = json.dumps(websiteKey)
+        action_js = json.dumps(action or "")
         script = f"""
         const existing = document.querySelector('#captcha-overlay');
         if (existing) existing.remove();
@@ -545,9 +656,9 @@ class TurnstileAPIServer:
 
         const captchaDiv = document.createElement('div');
         captchaDiv.className = 'cf-turnstile';
-        captchaDiv.setAttribute('data-sitekey', '{websiteKey}');
+        captchaDiv.setAttribute('data-sitekey', {sitekey_js});
         captchaDiv.setAttribute('data-callback', 'onCaptchaSuccess');
-        captchaDiv.setAttribute('data-action', '{action}');
+        captchaDiv.setAttribute('data-action', {action_js});
 
         overlay.appendChild(captchaDiv);
         document.body.appendChild(overlay);
@@ -583,24 +694,15 @@ class TurnstileAPIServer:
                 logger.warning(f"Browser {index}: Cannot check browser state: {str(e)}")
 
         if self.proxy_support:
-            proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
-
-            try:
-                with open(proxy_file_path) as proxy_file:
-                    proxies = [line.strip() for line in proxy_file if line.strip()]
-
-                proxy = random.choice(proxies) if proxies else None
-                
-                if self.debug and proxy:
-                    logger.debug(f"Browser {index}: Selected proxy: {proxy}")
-                elif self.debug and not proxy:
-                    logger.debug(f"Browser {index}: No proxies available")
-                    
-            except FileNotFoundError:
-                logger.warning(f"Proxy file not found: {proxy_file_path}")
-                proxy = None
-            except Exception as e:
-                logger.error(f"Error reading proxy file: {str(e)}")
+            proxy_record = await get_next_proxy()
+            if proxy_record:
+                proxy = self._build_proxy_url(proxy_record)
+                await mark_proxy_used(proxy_record['id'])
+                if self.debug:
+                    logger.debug(f"Browser {index}: Selected proxy from DB: {proxy_record['address']}")
+            else:
+                if self.debug:
+                    logger.debug(f"Browser {index}: No proxies available in DB")
                 proxy = None
 
             if proxy:
@@ -853,14 +955,7 @@ class TurnstileAPIServer:
 
     async def process_turnstile(self):
         """处理 /turnstile 端点请求"""
-        # 配额拦截：必须登录
-        user_id = session.get("user_id")
-        if not user_id:
-            return jsonify({
-                "errorId": 1,
-                "errorCode": "ERROR_UNAUTHORIZED",
-                "errorDescription": "请先登录"
-            }), 401
+        user_id = g.user_id
 
         url = request.args.get('url')
         sitekey = request.args.get('sitekey')
@@ -872,6 +967,14 @@ class TurnstileAPIServer:
                 "errorId": 1,
                 "errorCode": "ERROR_WRONG_PAGEURL",
                 "errorDescription": "Both 'url' and 'sitekey' are required"
+            }), 200
+
+        ok, reason = self._validate_target_url(url)
+        if not ok:
+            return jsonify({
+                "errorId": 1,
+                "errorCode": "ERROR_WRONG_PAGEURL",
+                "errorDescription": reason,
             }), 200
 
         # 配额拦截：原子扣减积分
@@ -956,22 +1059,17 @@ class TurnstileAPIServer:
     
 
     async def index(self):
-        """提供 API 文档页面"""
-        username = session.get("username")
-        if username:
-            user_block = f"""
-                <div class="flex items-center justify-between mb-4 px-1">
-                    <span class="text-sm text-gray-400">欢迎, <span class="text-blue-300">{username}</span></span>
-                    <div class="flex items-center gap-3">
-                        <a href="/dashboard/" class="text-xs text-green-400 hover:text-green-300">我的积分</a>
-                        <a href="/auth/logout" class="text-xs text-red-400 hover:text-red-300">登出</a>
-                    </div>
-                </div>"""
+        """主页：登录页面"""
+        # 已登录用户重定向到 dashboard
+        if session.get("user_id"):
+            return redirect("/dashboard/")
+
+        oauth_enabled = oauth_configured()
+        login_btn = ""
+        if oauth_enabled:
+            login_btn = '<a href="/auth/login" class="block w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-3 px-4 rounded-lg transition text-center">Linux DO 登录</a>'
         else:
-            user_block = """
-                <div class="flex justify-end mb-4 px-1">
-                    <a href="/auth/login" class="text-sm text-blue-400 hover:text-blue-300">Linux DO 登录</a>
-                </div>"""
+            login_btn = '<p class="text-gray-500 text-sm text-center">OAuth 未配置</p>'
 
         return f"""
             <!DOCTYPE html>
@@ -979,26 +1077,15 @@ class TurnstileAPIServer:
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Turnstile Solver API</title>
+                <title>Turnstile Solver</title>
                 <script src="https://cdn.tailwindcss.com"></script>
             </head>
-            <body class="bg-gray-900 text-gray-200 min-h-screen flex items-center justify-center">
-                <div class="bg-gray-800 p-8 rounded-lg shadow-md max-w-2xl w-full border border-blue-500">
-                    {user_block}
-                    <h1 class="text-3xl font-bold mb-6 text-center text-blue-400">Turnstile Solver API</h1>
-
-                    <p class="mb-4 text-gray-300">使用验证码求解服务，请向
-                       <code class="bg-blue-700 text-white px-2 py-1 rounded">/turnstile</code> 发送 GET 请求，并附带以下参数：</p>
-
-                    <ul class="list-disc pl-6 mb-6 text-gray-300">
-                        <li><strong>url</strong>: 需要验证 Turnstile 的目标网址</li>
-                        <li><strong>sitekey</strong>: Turnstile 站点密钥</li>
-                    </ul>
-
-                    <div class="bg-gray-700 p-4 rounded-lg mb-6 border border-blue-500">
-                        <p class="font-semibold mb-2 text-blue-400">使用示例：</p>
-                        <code class="text-sm break-all text-blue-300">/turnstile?url=https://example.com&sitekey=sitekey</code>
-                    </div>
+            <body class="bg-gray-950 text-gray-200 min-h-screen flex items-center justify-center">
+                <div class="bg-gray-900 border border-gray-700 rounded-lg p-8 max-w-sm w-full text-center">
+                    <h1 class="text-2xl font-bold text-blue-400 mb-2">Turnstile Solver</h1>
+                    <p class="text-gray-400 text-sm mb-6">Cloudflare Turnstile 验证码求解服务</p>
+                    {login_btn}
+                    <a href="/admin/login" class="block mt-4 text-xs text-gray-500 hover:text-gray-300">管理员登录</a>
                 </div>
             </body>
             </html>
@@ -1048,7 +1135,7 @@ Linux DO 登录</a>
             session["username"] = user["username"]
             session["trust_level"] = user["trust_level"]
             await init_user_credits(user["id"], user["trust_level"])
-        return redirect("/")
+        return redirect("/dashboard/")
 
     async def auth_logout(self):
         """用户登出"""
@@ -1236,39 +1323,178 @@ Linux DO 登录</a>
           <p id="adj-result" class="text-xs text-gray-500 mt-1 hidden"></p>
         </div>
       </div>
-    </div>
 
-    <!-- 右侧任务列表 -->
-    <div class="lg:col-span-2 bg-gray-900 border border-gray-700 rounded-lg p-4">
-      <div class="flex items-center justify-between mb-3">
-        <h2 class="text-sm font-semibold text-gray-300">任务列表</h2>
-        <div class="flex items-center gap-2">
-          <select id="task-filter" class="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs" onchange="currentPage=1;loadTasks()">
-            <option value="all">全部</option>
-            <option value="pending">待处理</option>
-            <option value="success">成功</option>
-            <option value="failed">失败</option>
-          </select>
-          <span class="text-xs text-gray-500" id="task-total">共 0 条</span>
+      <!-- 代理管理 -->
+      <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm font-semibold text-gray-300">代理管理</h2>
+          <span class="text-xs text-gray-500" id="proxy-total">共 0 个</span>
+        </div>
+        <div class="space-y-2 max-h-48 overflow-y-auto" id="proxy-list">
+          <p class="text-xs text-gray-600">加载中…</p>
+        </div>
+        <div class="mt-3 border-t border-gray-700 pt-3">
+          <p class="text-xs text-gray-400 mb-2">添加代理</p>
+          <div class="space-y-2">
+            <div class="flex gap-2">
+              <select id="proxy-protocol" class="w-20 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs">
+                <option value="http">http</option>
+                <option value="https">https</option>
+                <option value="socks5">socks5</option>
+              </select>
+              <input id="proxy-address" type="text" placeholder="IP:端口" class="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs focus:border-blue-500 outline-none">
+            </div>
+            <div class="flex gap-2">
+              <input id="proxy-username" type="text" placeholder="用户名(可选)" class="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs focus:border-blue-500 outline-none">
+              <input id="proxy-password" type="text" placeholder="密码(可选)" class="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs focus:border-blue-500 outline-none">
+            </div>
+            <button onclick="addProxy()" class="w-full bg-blue-600 hover:bg-blue-700 text-white text-xs py-1.5 rounded transition">添加</button>
+          </div>
+          <p id="proxy-result" class="text-xs text-gray-500 mt-1 hidden"></p>
         </div>
       </div>
-      <div class="overflow-x-auto">
-        <table class="w-full text-xs">
-          <thead><tr class="text-gray-400 border-b border-gray-700"><th class="text-left py-2 px-2">任务ID</th><th class="text-left py-2 px-2">状态</th><th class="text-left py-2 px-2">耗时</th><th class="text-left py-2 px-2">创建时间</th></tr></thead>
-          <tbody id="task-tbody"></tbody>
-        </table>
+
+      <!-- 为用户创建 Key -->
+      <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <h2 class="text-sm font-semibold text-gray-300 mb-3">为用户创建 API Key</h2>
+        <div class="space-y-2">
+          <div class="flex gap-2">
+            <input id="ak-uid" type="number" placeholder="用户ID" class="w-24 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs focus:border-blue-500 outline-none">
+            <input id="ak-name" type="text" placeholder="Key名称" class="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs focus:border-blue-500 outline-none">
+            <button onclick="adminCreateKey()" class="bg-blue-600 hover:bg-blue-700 text-white text-xs px-3 py-1 rounded transition">创建</button>
+          </div>
+          <div id="ak-result" class="hidden">
+            <p class="text-xs text-gray-400 mb-1">创建成功，请妥善保存：</p>
+            <input id="ak-key-display" type="text" readonly class="w-full bg-gray-800 border border-green-600 rounded px-2 py-1 text-xs text-green-400 font-mono">
+          </div>
+          <p id="ak-error" class="text-xs text-red-400 hidden"></p>
+        </div>
       </div>
-      <div class="flex items-center justify-between mt-3">
-        <button onclick="prevPage()" id="btn-prev" class="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded disabled:opacity-30 disabled:cursor-not-allowed transition" disabled>上一页</button>
-        <span id="page-info" class="text-xs text-gray-500">1 / 1</span>
-        <button onclick="nextPage()" id="btn-next" class="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded disabled:opacity-30 disabled:cursor-not-allowed transition" disabled>下一页</button>
+    </div>
+
+    <!-- 右侧：任务列表 + 使用教程 -->
+    <div class="lg:col-span-2 space-y-4">
+
+      <!-- 管理员快捷操作 -->
+      <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <h2 class="text-sm font-semibold text-gray-300 mb-3">管理员快捷操作</h2>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <!-- 创建自己的 Key -->
+          <div>
+            <p class="text-xs text-gray-400 mb-2">创建我的 API Key</p>
+            <div class="flex gap-2">
+              <input id="self-key-name" type="text" placeholder="Key名称" class="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs focus:border-blue-500 outline-none">
+              <button onclick="createSelfKey()" class="bg-green-600 hover:bg-green-700 text-white text-xs px-3 py-1 rounded transition">创建</button>
+            </div>
+            <div id="self-key-result" class="hidden mt-2">
+              <input id="self-key-display" type="text" readonly class="w-full bg-gray-800 border border-green-600 rounded px-2 py-1 text-xs text-green-400 font-mono cursor-pointer" onclick="this.select();document.execCommand('copy')">
+              <p class="text-[10px] text-gray-500 mt-1">点击复制，仅显示一次</p>
+            </div>
+            <p id="self-key-error" class="text-xs text-red-400 hidden mt-1"></p>
+          </div>
+          <!-- 给自己调积分 -->
+          <div>
+            <p class="text-xs text-gray-400 mb-2">调整我的积分</p>
+            <div class="flex gap-2">
+              <input id="self-credit-amount" type="number" placeholder="积分(正/负)" class="w-28 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs focus:border-blue-500 outline-none">
+              <input id="self-credit-desc" type="text" placeholder="说明" class="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs focus:border-blue-500 outline-none">
+              <button onclick="adjustSelfCredits()" class="bg-green-600 hover:bg-green-700 text-white text-xs px-3 py-1 rounded transition">调整</button>
+            </div>
+            <p id="self-credit-result" class="text-xs hidden mt-1"></p>
+          </div>
+        </div>
       </div>
+
+      <!-- 任务列表 -->
+      <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm font-semibold text-gray-300">任务列表</h2>
+          <div class="flex items-center gap-2">
+            <select id="task-filter" class="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs" onchange="currentPage=1;loadTasks()">
+              <option value="all">全部</option>
+              <option value="pending">待处理</option>
+              <option value="success">成功</option>
+              <option value="failed">失败</option>
+            </select>
+            <span class="text-xs text-gray-500" id="task-total">共 0 条</span>
+          </div>
+        </div>
+        <div class="overflow-x-auto max-h-64 overflow-y-auto">
+          <table class="w-full text-xs">
+            <thead><tr class="text-gray-400 border-b border-gray-700"><th class="text-left py-2 px-2">任务ID</th><th class="text-left py-2 px-2">状态</th><th class="text-left py-2 px-2">耗时</th><th class="text-left py-2 px-2">创建时间</th></tr></thead>
+            <tbody id="task-tbody"></tbody>
+          </table>
+        </div>
+        <div class="flex items-center justify-between mt-3">
+          <button onclick="prevPage()" id="btn-prev" class="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded disabled:opacity-30 disabled:cursor-not-allowed transition" disabled>上一页</button>
+          <span id="page-info" class="text-xs text-gray-500">1 / 1</span>
+          <button onclick="nextPage()" id="btn-next" class="text-xs bg-gray-800 hover:bg-gray-700 px-3 py-1 rounded disabled:opacity-30 disabled:cursor-not-allowed transition" disabled>下一页</button>
+        </div>
+      </div>
+
+      <!-- API 使用教程 -->
+      <div class="bg-gray-900 border border-gray-700 rounded-lg p-4">
+        <h2 class="text-sm font-semibold text-gray-300 mb-3">API 使用教程</h2>
+        <div class="space-y-4 text-sm text-gray-300">
+          <div>
+            <h3 class="font-medium text-blue-400 mb-1">认证方式</h3>
+            <p class="text-xs text-gray-400 mb-1">所有 API 请求需要使用 API Key 认证，支持两种方式：</p>
+            <ul class="list-disc pl-6 space-y-0.5 text-gray-500 text-xs">
+              <li>Header: <code class="bg-gray-800 px-1 rounded">Authorization: Bearer ts_xxx</code></li>
+              <li>Query: <code class="bg-gray-800 px-1 rounded">?key=ts_xxx</code></li>
+            </ul>
+          </div>
+          <div>
+            <h3 class="font-medium text-blue-400 mb-1">1. 创建任务</h3>
+            <div class="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-x-auto">GET /turnstile?url=https://example.com&amp;sitekey=YOUR_SITEKEY&amp;key=ts_xxx</div>
+            <p class="text-[11px] text-gray-500 mt-1">参数：<code>url</code>（目标网址）、<code>sitekey</code>（站点密钥）、<code>action</code>（可选）、<code>cdata</code>（可选）</p>
+            <p class="text-[11px] text-gray-500">返回：<code>{"errorId":0,"taskId":"uuid"}</code></p>
+          </div>
+          <div>
+            <h3 class="font-medium text-blue-400 mb-1">2. 查询结果</h3>
+            <div class="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-x-auto">GET /result?id=TASK_ID&amp;key=ts_xxx</div>
+            <p class="text-[11px] text-gray-500 mt-1">处理中：<code>{"status":"processing"}</code></p>
+            <p class="text-[11px] text-gray-500">成功：<code>{"errorId":0,"status":"ready","solution":{"token":"..."}}</code></p>
+            <p class="text-[11px] text-gray-500">失败：<code>{"errorId":1,"errorCode":"ERROR_CAPTCHA_UNSOLVABLE"}</code></p>
+          </div>
+          <div>
+            <h3 class="font-medium text-blue-400 mb-1">3. 完整流程示例（Python）</h3>
+            <div class="bg-gray-800 rounded p-2 text-xs font-mono text-gray-300 overflow-x-auto whitespace-pre">import requests, time
+
+API = "https://your-domain.com"
+KEY = "ts_xxxx"
+
+# 创建任务
+r = requests.get(f"{API}/turnstile", params={
+    "url": "https://example.com",
+    "sitekey": "0x4AAAAAAA...",
+    "key": KEY
+}).json()
+task_id = r["taskId"]
+
+# 轮询结果
+for _ in range(60):
+    r = requests.get(f"{API}/result", params={
+        "id": task_id, "key": KEY
+    }).json()
+    if r.get("status") == "ready":
+        print("Token:", r["solution"]["token"])
+        break
+    time.sleep(2)</div>
+          </div>
+        </div>
+      </div>
+
     </div>
   </div>
 </div>
 
 <script>
 let currentPage=1, totalPages=1, pollTimer=null, hasPending=false;
+
+function escapeHtml(v){
+  return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
 function api(path,opts){return fetch('/admin/api/'+path,opts).then(r=>r.json())}
 
@@ -1315,9 +1541,11 @@ async function loadTasks(){
         else{status='未知';cls='text-gray-400'}
       }else{status='未知';cls='text-gray-400'}
       const elapsed=t.data&&t.data.elapsed_time?t.data.elapsed_time+'s':'-';
+      const tid=String(t.task_id||'');
+      const tidShort=tid.substring(0,8)+'…';
       const tr=document.createElement('tr');
       tr.className='border-b border-gray-800 hover:bg-gray-800/50';
-      tr.innerHTML='<td class="py-2 px-2 font-mono text-gray-400" title="'+t.task_id+'">'+t.task_id.substring(0,8)+'…</td><td class="py-2 px-2"><span class="'+cls+'">'+status+'</span></td><td class="py-2 px-2">'+elapsed+'</td><td class="py-2 px-2 text-gray-500">'+( t.created_at||'-')+'</td>';
+      tr.innerHTML='<td class="py-2 px-2 font-mono text-gray-400" title="'+escapeHtml(tid)+'">'+escapeHtml(tidShort)+'</td><td class="py-2 px-2"><span class="'+cls+'">'+escapeHtml(status)+'</span></td><td class="py-2 px-2">'+escapeHtml(elapsed)+'</td><td class="py-2 px-2 text-gray-500">'+escapeHtml(t.created_at||'-')+'</td>';
       tbody.appendChild(tr);
     });
     if(d.items.length===0){
@@ -1370,7 +1598,7 @@ async function loadUsers(){
     document.getElementById('user-total').textContent='共 '+d.total+' 人';
     const el=document.getElementById('user-list');
     if(d.items.length===0){el.innerHTML='<p class="text-xs text-gray-600">暂无用户</p>';return;}
-    el.innerHTML=d.items.map(u=>'<div class="flex items-center justify-between text-xs py-1 border-b border-gray-800"><div class="flex items-center gap-2"><span class="text-gray-300">'+u.username+'</span><span class="text-gray-600">'+(u.name||'')+'</span></div><div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded text-[10px] '+(u.trust_level>=2?'bg-green-900/50 text-green-400':'bg-gray-800 text-gray-400')+'">TL'+u.trust_level+'</span></div></div>').join('');
+    el.innerHTML=d.items.map(u=>'<div class="flex items-center justify-between text-xs py-1 border-b border-gray-800"><div class="flex items-center gap-2"><span class="text-gray-300">'+escapeHtml(u.username)+'</span><span class="text-gray-600">'+escapeHtml(u.name||'')+'</span></div><div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded text-[10px] '+(u.trust_level>=2?'bg-green-900/50 text-green-400':'bg-gray-800 text-gray-400')+'">TL'+escapeHtml(u.trust_level)+'</span></div></div>').join('');
   }catch(e){console.error('loadUsers',e)}
 }
 
@@ -1380,7 +1608,7 @@ async function loadCreditsAdmin(){
     document.getElementById('credit-total').textContent='共 '+d.total+' 人';
     const el=document.getElementById('credit-list');
     if(d.items.length===0){el.innerHTML='<p class="text-xs text-gray-600">暂无数据</p>';return;}
-    el.innerHTML=d.items.map(c=>'<div class="flex items-center justify-between text-xs py-1 border-b border-gray-800"><div class="flex items-center gap-2"><span class="text-gray-300">'+c.username+'</span><span class="text-gray-600">ID:'+c.id+'</span></div><div class="flex items-center gap-2"><span class="text-green-400 font-mono">'+c.balance+'</span><span class="text-gray-600">TL'+c.trust_level+'</span></div></div>').join('');
+    el.innerHTML=d.items.map(c=>'<div class="flex items-center justify-between text-xs py-1 border-b border-gray-800"><div class="flex items-center gap-2"><span class="text-gray-300">'+escapeHtml(c.username)+'</span><span class="text-gray-600">ID:'+escapeHtml(c.id)+'</span></div><div class="flex items-center gap-2"><span class="text-green-400 font-mono">'+escapeHtml(c.balance)+'</span><span class="text-gray-600">TL'+escapeHtml(c.trust_level)+'</span></div></div>').join('');
   }catch(e){console.error('loadCreditsAdmin',e)}
 }
 
@@ -1406,8 +1634,93 @@ function startPolling(){
   tick();
   loadUsers();
   loadCreditsAdmin();
+  loadProxies();
   setInterval(loadUsers,30000);
   setInterval(loadCreditsAdmin,30000);
+  setInterval(loadProxies,30000);
+}
+
+async function loadProxies(){
+  try{
+    const d=await api('proxies');
+    document.getElementById('proxy-total').textContent='共 '+d.total+' 个';
+    const el=document.getElementById('proxy-list');
+    if(d.items.length===0){el.innerHTML='<p class="text-xs text-gray-600">暂无代理</p>';return;}
+    el.innerHTML=d.items.map(p=>{
+      const status=p.enabled?'<span class="text-green-400">启用</span>':'<span class="text-red-400">禁用</span>';
+      const auth=p.username?'<span class="text-gray-600">(有认证)</span>':'';
+      return '<div class="flex items-center justify-between text-xs py-1 border-b border-gray-800"><div class="flex items-center gap-2"><span class="text-gray-400 font-mono">'+escapeHtml(p.protocol)+'://'+escapeHtml(p.address)+'</span>'+auth+'</div><div class="flex items-center gap-2">'+status+'<button onclick="toggleProxy('+p.id+','+(!p.enabled?1:0)+')" class="text-blue-400 hover:text-blue-300 text-[10px]">'+(p.enabled?'禁用':'启用')+'</button><button onclick="deleteProxy('+p.id+')" class="text-red-400 hover:text-red-300 text-[10px]">删除</button></div></div>';
+    }).join('');
+  }catch(e){console.error('loadProxies',e)}
+}
+
+async function addProxy(){
+  const protocol=document.getElementById('proxy-protocol').value;
+  const address=document.getElementById('proxy-address').value;
+  const username=document.getElementById('proxy-username').value;
+  const password=document.getElementById('proxy-password').value;
+  const el=document.getElementById('proxy-result');
+  if(!address){el.textContent='请填写地址';el.className='text-xs mt-1 text-red-400';el.classList.remove('hidden');return;}
+  try{
+    const d=await api('proxies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({protocol,address,username,password})});
+    if(d.id){el.textContent='添加成功';el.className='text-xs mt-1 text-green-400';loadProxies();document.getElementById('proxy-address').value='';document.getElementById('proxy-username').value='';document.getElementById('proxy-password').value='';}
+    else{el.textContent=d.error||'添加失败';el.className='text-xs mt-1 text-red-400';}
+    el.classList.remove('hidden');setTimeout(()=>el.classList.add('hidden'),3000);
+  }catch(e){el.textContent='网络错误';el.className='text-xs mt-1 text-red-400';el.classList.remove('hidden');}
+}
+
+async function toggleProxy(id,enabled){
+  try{
+    await api('proxies/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
+    loadProxies();
+  }catch(e){console.error('toggleProxy',e)}
+}
+
+async function deleteProxy(id){
+  if(!confirm('确定删除该代理？')) return;
+  try{
+    await api('proxies/'+id,{method:'DELETE'});
+    loadProxies();
+  }catch(e){console.error('deleteProxy',e)}
+}
+
+async function adminCreateKey(){
+  const uid=document.getElementById('ak-uid').value;
+  const name=document.getElementById('ak-name').value;
+  const resultEl=document.getElementById('ak-result');
+  const errorEl=document.getElementById('ak-error');
+  resultEl.classList.add('hidden');errorEl.classList.add('hidden');
+  if(!uid){errorEl.textContent='请填写用户ID';errorEl.classList.remove('hidden');return;}
+  try{
+    const d=await api('keys/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:parseInt(uid),name})});
+    if(d.key){resultEl.classList.remove('hidden');document.getElementById('ak-key-display').value=d.key;}
+    else{errorEl.textContent=d.error||'创建失败';errorEl.classList.remove('hidden');}
+  }catch(e){errorEl.textContent='网络错误';errorEl.classList.remove('hidden');}
+}
+
+async function createSelfKey(){
+  const name=document.getElementById('self-key-name').value;
+  const resultEl=document.getElementById('self-key-result');
+  const errorEl=document.getElementById('self-key-error');
+  resultEl.classList.add('hidden');errorEl.classList.add('hidden');
+  try{
+    const d=await api('keys/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:'__ADMIN__',name})});
+    if(d.key){resultEl.classList.remove('hidden');document.getElementById('self-key-display').value=d.key;}
+    else{errorEl.textContent=d.error||'创建失败';errorEl.classList.remove('hidden');}
+  }catch(e){errorEl.textContent='网络错误';errorEl.classList.remove('hidden');}
+}
+
+async function adjustSelfCredits(){
+  const amount=document.getElementById('self-credit-amount').value;
+  const desc=document.getElementById('self-credit-desc').value;
+  const el=document.getElementById('self-credit-result');
+  if(!amount){el.textContent='请填写积分';el.className='text-xs mt-1 text-red-400';el.classList.remove('hidden');return;}
+  try{
+    const d=await api('credits/adjust',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user_id:'__ADMIN__',amount:parseFloat(amount),description:desc||'管理员自调'})});
+    if(d.success){el.textContent='调整成功';el.className='text-xs mt-1 text-green-400';loadCreditsAdmin();}
+    else{el.textContent=d.error||'调整失败';el.className='text-xs mt-1 text-red-400';}
+    el.classList.remove('hidden');setTimeout(()=>el.classList.add('hidden'),3000);
+  }catch(e){el.textContent='网络错误';el.className='text-xs mt-1 text-red-400';el.classList.remove('hidden');}
 }
 
 startPolling();
@@ -1476,7 +1789,11 @@ startPolling();
     async def admin_cleanup(self):
         """手动清理数据库旧数据"""
         body = await request.get_json() or {}
-        days = body.get("days_old", 7)
+        try:
+            days = int(body.get("days_old", 7))
+        except (TypeError, ValueError):
+            return jsonify({"error": "days_old must be an integer"}), 400
+        days = max(1, min(days, 3650))
         deleted = await cleanup_old_results(days_old=days)
         return jsonify({"deleted": deleted})
 
@@ -1562,6 +1879,8 @@ startPolling();
         """EasyPay 异步通知回调"""
         params = dict(request.args)
         cfg = get_credit_config()
+        if not cfg.get("key"):
+            return "not configured", 503
         if not verify_sign(params, cfg["key"]):
             return "sign error", 400
 
@@ -1606,13 +1925,22 @@ startPolling();
         user_id = body.get("user_id")
         amount = body.get("amount")
         description = body.get("description", "")
-        if not user_id or amount is None:
-            return jsonify({"error": "user_id 和 amount 必填"}), 400
+        # __ADMIN__ 表示管理员调整自己的积分
+        if user_id == "__ADMIN__":
+            user_id = await self._ensure_admin_user()
+            if not user_id:
+                return jsonify({"error": "管理员用户初始化失败"}), 500
+        elif not user_id:
+            return jsonify({"error": "user_id 必填"}), 400
+        else:
+            user_id = int(user_id)
+        if amount is None:
+            return jsonify({"error": "amount 必填"}), 400
         try:
             amount = float(amount)
         except (TypeError, ValueError):
             return jsonify({"error": "amount 无效"}), 400
-        ok = await admin_adjust_credits(int(user_id), amount, description)
+        ok = await admin_adjust_credits(user_id, amount, description)
         return jsonify({"success": ok})
 
     async def admin_orders_list(self):
@@ -1621,6 +1949,138 @@ startPolling();
         per_page = request.args.get('per_page', 50, type=int)
         data = await admin_get_all_orders(page, per_page)
         return jsonify(data)
+
+    # ========== API Key 管理 ==========
+
+    async def api_user_keys_list(self):
+        """列出当前用户的 API Keys"""
+        user_id = session.get("user_id") or g.get("user_id")
+        if not user_id:
+            return jsonify({"error": "unauthorized"}), 401
+        keys = await list_api_keys(user_id)
+        return jsonify({"keys": keys})
+
+    async def api_user_keys_create(self):
+        """创建新 API Key（仅 session 登录用户可操作）"""
+        user_id = session.get("user_id")
+        if not user_id:
+            return jsonify({"error": "仅登录用户可创建 API Key，不允许通过 API Key 创建"}), 403
+        data = await request.get_json(silent=True) or {}
+        name = str(data.get("name", ""))[:50]
+        raw_key = await create_api_key(user_id, name)
+        if raw_key is None:
+            return jsonify({"error": "已达到最大 Key 数量限制（5 个）"}), 400
+        return jsonify({"key": raw_key, "message": "请妥善保存，此密钥仅显示一次"})
+
+    async def api_user_keys_revoke(self, key_id: int):
+        """撤销指定 API Key"""
+        user_id = session.get("user_id")
+        if not user_id:
+            return jsonify({"error": "仅登录用户可撤销 API Key"}), 403
+        ok = await revoke_api_key(user_id, key_id)
+        if not ok:
+            return jsonify({"error": "Key 不存在或已撤销"}), 404
+        return jsonify({"message": "已撤销"})
+
+    async def admin_api_keys_list(self):
+        """管理员查看所有 API Keys"""
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 50, type=int)
+        data = await admin_list_all_api_keys(page, per_page)
+        return jsonify(data)
+
+    # ========== 管理员代理管理 ==========
+
+    async def admin_proxies_list(self):
+        """列出所有代理"""
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 50, type=int)
+        data = await list_proxies(enabled_only=False, page=page, per_page=per_page)
+        return jsonify(data)
+
+    async def admin_proxies_add(self):
+        """添加代理"""
+        body = await request.get_json()
+        if not body:
+            return jsonify({"error": "参数错误"}), 400
+        address = body.get("address", "").strip()
+        if not address:
+            return jsonify({"error": "address 必填"}), 400
+        protocol = body.get("protocol", "http").strip()
+        username = body.get("username", "").strip()
+        password = body.get("password", "").strip()
+        proxy_id = await add_proxy(protocol, address, username, password)
+        if proxy_id is None:
+            return jsonify({"error": "添加失败"}), 500
+        return jsonify({"id": proxy_id, "message": "添加成功"})
+
+    async def admin_proxies_update(self, proxy_id: int):
+        """更新代理"""
+        body = await request.get_json()
+        if not body:
+            return jsonify({"error": "参数错误"}), 400
+        ok = await update_proxy(proxy_id, **body)
+        if not ok:
+            return jsonify({"error": "更新失败"}), 404
+        return jsonify({"message": "更新成功"})
+
+    async def admin_proxies_delete(self, proxy_id: int):
+        """删除代理"""
+        ok = await delete_proxy(proxy_id)
+        if not ok:
+            return jsonify({"error": "删除失败"}), 404
+        return jsonify({"message": "删除成功"})
+
+    async def admin_keys_create(self):
+        """管理员为指定用户创建 API Key"""
+        body = await request.get_json()
+        if not body:
+            return jsonify({"error": "参数错误"}), 400
+        user_id = body.get("user_id")
+        name = str(body.get("name", ""))[:50]
+        # __ADMIN__ 表示管理员为自己创建
+        if user_id == "__ADMIN__":
+            user_id = await self._ensure_admin_user()
+            if not user_id:
+                return jsonify({"error": "管理员用户初始化失败"}), 500
+        else:
+            if not user_id:
+                return jsonify({"error": "user_id 必填"}), 400
+            user_id = int(user_id)
+            user = await get_user_by_id(user_id)
+            if not user:
+                return jsonify({"error": "用户不存在"}), 404
+        raw_key = await admin_create_api_key(user_id, name)
+        if raw_key is None:
+            return jsonify({"error": "创建失败"}), 500
+        return jsonify({"key": raw_key, "message": "创建成功，请妥善保存"})
+
+    @staticmethod
+    def _build_proxy_url(proxy_record: dict) -> str:
+        """根据代理记录构建代理 URL"""
+        protocol = proxy_record.get("protocol", "http")
+        address = proxy_record.get("address", "")
+        username = proxy_record.get("username", "")
+        password = proxy_record.get("password", "")
+        if username and password:
+            return f"{protocol}://{username}:{password}@{address}"
+        return f"{protocol}://{address}"
+
+    async def _ensure_admin_user(self) -> Optional[int]:
+        """确保管理员在 users 表中有记录，返回 user_id"""
+        admin_user = await upsert_user({
+            "id": 0,
+            "username": "admin",
+            "name": "管理员",
+            "avatar_template": "",
+            "trust_level": 4,
+            "active": True,
+            "silenced": False,
+        })
+        if admin_user:
+            await init_user_credits(admin_user["id"], 4)
+            return admin_user["id"]
+        return None
 
     # ========== 用户仪表盘页面 ==========
 
@@ -1729,12 +2189,48 @@ startPolling();
       </div>
     </div>
   </div>
+
+  <!-- API 使用教程 -->
+  <div class="mt-6 bg-gray-900 border border-gray-700 rounded-lg">
+    <button onclick="this.nextElementSibling.classList.toggle('hidden');this.querySelector('span:last-child').textContent=this.nextElementSibling.classList.contains('hidden')?'▶':'▼'" class="w-full flex items-center justify-between p-4 text-left">
+      <span class="text-sm font-semibold text-gray-300">API 使用教程</span>
+      <span class="text-gray-500 text-xs">▶</span>
+    </button>
+    <div class="hidden px-4 pb-4">
+      <div class="space-y-4 text-sm text-gray-300">
+        <div>
+          <h3 class="font-medium text-blue-400 mb-2">认证方式</h3>
+          <p class="mb-1">所有 API 请求需要使用 API Key 认证，支持两种方式：</p>
+          <ul class="list-disc pl-6 space-y-1 text-gray-400 text-xs">
+            <li>Header: <code class="bg-gray-800 px-1 rounded">Authorization: Bearer ts_xxx</code></li>
+            <li>Query: <code class="bg-gray-800 px-1 rounded">?key=ts_xxx</code></li>
+          </ul>
+        </div>
+        <div>
+          <h3 class="font-medium text-blue-400 mb-2">创建任务</h3>
+          <p class="mb-1">向 <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300">/turnstile</code> 发送 GET 请求：</p>
+          <div class="bg-gray-800 rounded p-3 text-xs font-mono text-gray-300 overflow-x-auto">GET /turnstile?url=https://example.com&amp;sitekey=YOUR_SITEKEY&amp;key=ts_xxx</div>
+          <p class="text-xs text-gray-500 mt-1">参数：url（目标网址）、sitekey（站点密钥）、action（可选）、cdata（可选）</p>
+        </div>
+        <div>
+          <h3 class="font-medium text-blue-400 mb-2">查询结果</h3>
+          <p class="mb-1">向 <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300">/result</code> 发送 GET 请求：</p>
+          <div class="bg-gray-800 rounded p-3 text-xs font-mono text-gray-300 overflow-x-auto">GET /result?id=TASK_ID&amp;key=ts_xxx</div>
+          <p class="text-xs text-gray-500 mt-1">返回 status: "processing" 表示处理中，errorId: 0 + solution.token 表示成功</p>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
 let logPage=1,logTotal=1,orderPage=1,orderTotal=1;
 const TYPE_MAP={initial:'注册赠送',checkin:'签到',recharge:'充值',consume:'消耗',refund:'退款',admin_adjust:'管理员调整'};
 const STATUS_MAP={pending:'待支付',paid:'已支付',failed:'失败',refunded:'已退款'};
+
+function escapeHtml(v){
+  return String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
 async function api(path,opts){const r=await fetch(path,opts);return r.json()}
 
@@ -1798,9 +2294,11 @@ async function loadLog(){
     d.items.forEach(i=>{
       const cls=i.amount>=0?'text-green-400':'text-red-400';
       const sign=i.amount>=0?'+':'';
+      const desc=i.description||'';
+      const descText=desc?desc:'-';
       const tr=document.createElement('tr');
       tr.className='border-b border-gray-800';
-      tr.innerHTML='<td class="py-1.5 px-2 text-gray-500">'+(i.created_at||'-')+'</td><td class="py-1.5 px-2">'+(TYPE_MAP[i.type]||i.type)+'</td><td class="py-1.5 px-2 '+cls+'">'+sign+i.amount+'</td><td class="py-1.5 px-2">'+i.balance_after+'</td><td class="py-1.5 px-2 text-gray-500 truncate max-w-[120px]" title="'+(i.description||'')+'">'+(i.description||'-')+'</td>';
+      tr.innerHTML='<td class="py-1.5 px-2 text-gray-500">'+escapeHtml(i.created_at||'-')+'</td><td class="py-1.5 px-2">'+escapeHtml((TYPE_MAP[i.type]||i.type))+'</td><td class="py-1.5 px-2 '+cls+'">'+escapeHtml(sign+i.amount)+'</td><td class="py-1.5 px-2">'+escapeHtml(i.balance_after)+'</td><td class="py-1.5 px-2 text-gray-500 truncate max-w-[120px]" title="'+escapeHtml(desc)+'">'+escapeHtml(descText)+'</td>';
       tbody.appendChild(tr);
     });
   }catch(e){console.error('loadLog',e)}
@@ -1821,9 +2319,11 @@ async function loadOrders(){
     if(d.items.length===0){tbody.innerHTML='<tr><td colspan="5" class="text-center py-4 text-gray-600">暂无订单</td></tr>';return;}
     d.items.forEach(o=>{
       const scls=o.status==='paid'?'text-green-400':(o.status==='pending'?'text-yellow-400':'text-red-400');
+      const tradeNo=String(o.out_trade_no||'');
+      const tradeNoShort=tradeNo.substring(0,16)+'…';
       const tr=document.createElement('tr');
       tr.className='border-b border-gray-800';
-      tr.innerHTML='<td class="py-1.5 px-2 font-mono text-gray-400 text-[10px]" title="'+o.out_trade_no+'">'+o.out_trade_no.substring(0,16)+'…</td><td class="py-1.5 px-2">'+o.money+'元</td><td class="py-1.5 px-2">'+o.amount+'</td><td class="py-1.5 px-2 '+scls+'">'+(STATUS_MAP[o.status]||o.status)+'</td><td class="py-1.5 px-2 text-gray-500">'+(o.created_at||'-')+'</td>';
+      tr.innerHTML='<td class="py-1.5 px-2 font-mono text-gray-400 text-[10px]" title="'+escapeHtml(tradeNo)+'">'+escapeHtml(tradeNoShort)+'</td><td class="py-1.5 px-2">'+escapeHtml(o.money)+'元</td><td class="py-1.5 px-2">'+escapeHtml(o.amount)+'</td><td class="py-1.5 px-2 '+scls+'">'+escapeHtml((STATUS_MAP[o.status]||o.status))+'</td><td class="py-1.5 px-2 text-gray-500">'+escapeHtml(o.created_at||'-')+'</td>';
       tbody.appendChild(tr);
     });
   }catch(e){console.error('loadOrders',e)}
@@ -1844,7 +2344,8 @@ loadCredits();loadLog();loadOrders();
 </body>
 </html>"""
         username = session.get("username", "")
-        return self._dashboard_template.replace("__USERNAME__", username)
+        safe_username = html.escape(str(username), quote=True)
+        return self._dashboard_template.replace("__USERNAME__", safe_username)
 
 
 def parse_args():
@@ -1855,7 +2356,7 @@ def parse_args():
     parser.add_argument('--useragent', type=str, help='User-Agent string (if not specified, random configuration is used)')
     parser.add_argument('--debug', action='store_true', help='Enable or disable debug mode for additional logging and troubleshooting information (default: False)')
     parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox (default: chromium)')
-    parser.add_argument('--thread', type=int, default=4, help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
+    parser.add_argument('--thread', type=int, default=1, help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
     parser.add_argument('--proxy', action='store_true', help='Enable proxy support for the solver (Default: False)')
     parser.add_argument('--random', action='store_true', help='Use random User-Agent and Sec-CH-UA configuration from pool')
     parser.add_argument('--browser', type=str, help='Specify browser name to use (e.g., chrome, firefox)')
@@ -1873,6 +2374,11 @@ def create_app(headless: bool, useragent: str, debug: bool, browser_type: str, t
 
 if __name__ == '__main__':
     args = parse_args()
+
+    if not os.environ.get("ADMIN_PASSWORD"):
+        logger.error("必须设置 ADMIN_PASSWORD 环境变量")
+        sys.exit(1)
+
     browser_types = [
         'chromium',
         'chrome',

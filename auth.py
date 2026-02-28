@@ -10,7 +10,9 @@ import functools
 from urllib.parse import urlencode
 
 import httpx
-from quart import session, redirect, request, jsonify
+from quart import session, redirect, request, jsonify, g
+
+from db_results import validate_api_key
 
 logger = logging.getLogger("TurnstileAPIServer")
 
@@ -135,14 +137,55 @@ def require_admin(f):
     return decorated
 
 
+async def get_api_key_user_id() -> int | None:
+    """从请求中提取 API Key 并验证，返回 user_id 或 None"""
+    raw_key = None
+    # 优先级 1: Authorization: Bearer ts_xxx
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer ts_"):
+        raw_key = auth_header[7:]  # 去掉 "Bearer "
+    # 优先级 2: ?key=ts_xxx
+    if not raw_key:
+        raw_key = request.args.get("key")
+    if not raw_key or not raw_key.startswith("ts_"):
+        return None
+    return await validate_api_key(raw_key)
+
+
 def require_user(f):
-    """用户认证装饰器"""
+    """用户认证装饰器：支持 session cookie 和 API Key 双重鉴权"""
     @functools.wraps(f)
     async def decorated(*args, **kwargs):
-        if not session.get("user_id"):
-            if request.is_json:
-                return jsonify({"error": "unauthorized"}), 401
-            return redirect("/auth/login")
+        user_id = session.get("user_id")
+        if user_id:
+            g.user_id = user_id
+            g.auth_type = "session"
+            return await f(*args, **kwargs)
+        # 尝试 API Key 鉴权
+        api_user_id = await get_api_key_user_id()
+        if api_user_id:
+            g.user_id = api_user_id
+            g.auth_type = "api_key"
+            return await f(*args, **kwargs)
+        if request.is_json or request.headers.get("Authorization"):
+            return jsonify({"error": "unauthorized"}), 401
+        return redirect("/auth/login")
+    return decorated
+
+
+def require_api_key(f):
+    """API Key 专用鉴权装饰器：仅接受 API Key，拒绝 session"""
+    @functools.wraps(f)
+    async def decorated(*args, **kwargs):
+        api_user_id = await get_api_key_user_id()
+        if not api_user_id:
+            return jsonify({
+                "errorId": 1,
+                "errorCode": "ERROR_UNAUTHORIZED",
+                "errorDescription": "需要有效的 API Key"
+            }), 401
+        g.user_id = api_user_id
+        g.auth_type = "api_key"
         return await f(*args, **kwargs)
     return decorated
 

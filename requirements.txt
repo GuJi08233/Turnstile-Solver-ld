@@ -1,8 +1,7 @@
 quart
-asyncio
-argparse
 patchright
 camoufox[geoip]
 requests
+httpx
 aiosqlite
 rich
